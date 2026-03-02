@@ -234,7 +234,7 @@ export async function performSyncChunk(
   } = options;
 
   const syncMode = isIncremental ? "incremental" : "full";
-  let db: any = null;
+  const db: any = null;
 
   try {
     // Get the data source
@@ -466,7 +466,7 @@ export async function performSync(
   );
   const syncMode = isIncremental ? "incremental" : "full";
   logger?.log("debug", `Sync mode determined as: ${syncMode}`);
-  let db: any = null;
+  const db: any = null;
 
   try {
     // Validate configuration
