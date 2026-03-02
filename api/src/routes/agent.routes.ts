@@ -393,10 +393,10 @@ agentRoutes.post("/chat", async (c) => {
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
 
   const {
-    question, user_id, user_role, consoleId, openConsoles,
+    question, user_id, user_role, consoleId, openConsoles, history = [],
   } = body as {
     question?: string; user_id?: string | number; user_role?: string | number;
-    consoleId?: string; openConsoles?: any[];
+    consoleId?: string; openConsoles?: any[]; history?: { role: 'user' | 'assistant', content: string }[];
   };
 
   if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
@@ -415,7 +415,10 @@ agentRoutes.post("/chat", async (c) => {
       const result = await generateText({
         model: reasonerModel,
         system: GENERAL_KNOWLEDGE_PROMPT,
-        messages: [{ role: "user" as const, content: question.trim() }],
+        messages: [
+          ...(history as any),
+          { role: "user" as const, content: question.trim() }
+        ],
         temperature: 0.4,
       });
       return c.json({ report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 });
@@ -433,8 +436,11 @@ agentRoutes.post("/chat", async (c) => {
       model: makeDeepSeekModel("deepseek-chat"),
       system: `You are a JSON-only classifier. Output ONLY a valid JSON object, no markdown, no explanation.`,
       messages: [{
-        role: "user" as const, content: `Analyze this user question about an educational database:
-"${question.trim()}"
+        role: "user" as const, content: `Analyze this user question about an educational database.
+Previous Chat Context (if any):
+${history.map((h: any) => `${h.role}: ${h.content}`).join('\\n') || "None"}
+
+Current Question: "${question.trim()}"
 
 Return a JSON object with these fields:
 - "type": one of "ranking", "student_profile", "college_profile", "comparison", "count", "aggregation", "other"
@@ -609,7 +615,10 @@ JSON only:` }],
     const result = await generateText({
       model: chatModel,
       system: systemPrompt,
-      messages: [{ role: "user" as const, content: question.trim() }],
+      messages: [
+        ...(history as any),
+        { role: "user" as const, content: question.trim() }
+      ],
       tools: tools as any,
       stopWhen: stepCountIs(8),
       temperature: 0,
@@ -679,8 +688,8 @@ agentRoutes.post("/chat-v2", async (c) => {
   let body: Record<string, any> = {};
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
 
-  const { question, user_id, user_role } = body as {
-    question?: string; user_id?: string | number; user_role?: string | number;
+  const { question, user_id, user_role, history = [] } = body as {
+    question?: string; user_id?: string | number; user_role?: string | number; history?: { role: 'user' | 'assistant', content: string }[];
   };
 
   if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
@@ -701,7 +710,10 @@ agentRoutes.post("/chat-v2", async (c) => {
       const result = await generateText({
         model: reasonerModel,
         system: GENERAL_KNOWLEDGE_PROMPT,
-        messages: [{ role: "user" as const, content: question.trim() }],
+        messages: [
+          ...(history as any),
+          { role: "user" as const, content: question.trim() }
+        ],
         temperature: 0.4,
       });
       return c.json({ report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 });
@@ -719,8 +731,11 @@ agentRoutes.post("/chat-v2", async (c) => {
       model: makeDeepSeekModel("deepseek-chat"),
       system: `You are a JSON-only classifier. Output ONLY a valid JSON object, no markdown, no explanation.`,
       messages: [{
-        role: "user" as const, content: `Analyze this user question about an educational database:
-"${question.trim()}"
+        role: "user" as const, content: `Analyze this user question about an educational database.
+Previous Chat Context (if any):
+${history.map((h: any) => `${h.role}: ${h.content}`).join('\\n') || "None"}
+
+Current Question: "${question.trim()}"
 
 Return a JSON object with these fields:
 - "type": one of "ranking", "student_profile", "college_profile", "comparison", "count", "aggregation", "other"
@@ -886,7 +901,10 @@ JSON only:` }],
     const result = await generateText({
       model: chatModel,
       system: systemPrompt,
-      messages: [{ role: "user" as const, content: question.trim() }],
+      messages: [
+        ...(history as any),
+        { role: "user" as const, content: question.trim() }
+      ],
       tools,
       stopWhen: stepCountIs(8),
       temperature: 0,
@@ -932,7 +950,10 @@ ${allDataJson.slice(0, 12000)}${allDataJson.length > 12000 ? "\n...(truncated to
     const reportResult = await generateText({
       model: reasonerModel,
       system: REPORT_SYSTEM_PROMPT,
-      messages: [{ role: "user" as const, content: reportUserPrompt }],
+      messages: [
+        ...(history as any),
+        { role: "user" as const, content: reportUserPrompt }
+      ],
       temperature: 0,
     });
 
