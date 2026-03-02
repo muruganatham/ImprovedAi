@@ -346,8 +346,7 @@ CERTIFICATES: verify_certificates WHERE status = 1
 4. admin_test_data = admin testing, NOT real student data
 5. total_mark JSON can have 0 — use NULLIF to avoid division by zero
 6. status=2 means inactive — always filter status=1
-7. course_academic_maps.db column tells which test tables to use`;
-
+7. course_academic_maps.db column tells which test tables to use
 ` + getSmartRegistryContext();
 
 // ── Report generation system prompt ───────────────────────────────────────────
@@ -426,48 +425,76 @@ Report:
 NOW generate a report following these rules.Be CONCISE.`;
 
 // ── SQL Validation Helper ───────────────────────────────────────────────────────
-function validateSQL(sql: string): string[] {
+function validateSQL(sql: string, context?: { type: string }): string[] {
   const issues: string[] = [];
   const upper = sql.toUpperCase();
-  if (upper.includes("SELECT *")) issues.push("RULE VIOLATION: Don't use SELECT *. Select only specific needed columns.");
-  if (!upper.includes("JOIN USERS") && !upper.includes("FROM USERS") && (upper.includes("TEST_DATA") || upper.includes("RESULT"))) {
-    issues.push("RULE VIOLATION: Must JOIN users table to get real student names.");
+
+  // Only block SELECT * on large tables, allow it on small lookups
+  if (upper.includes("SELECT *") && !upper.includes("LIMIT")) {
+    issues.push("RULE VIOLATION: Don't use SELECT * without LIMIT. Select specific columns.");
   }
-  if (!upper.includes("ORDER BY") && (upper.includes("BEST") || upper.includes("TOP") || upper.includes("PERFORM"))) {
+
+  // Only require JOIN users for ranking/profile queries, not counts
+  if (context?.type === "ranking" || context?.type === "student_profile") {
+    if (!upper.includes("JOIN USERS") && !upper.includes("FROM USERS") && (upper.includes("TEST_DATA") || upper.includes("RESULT"))) {
+      issues.push("RULE VIOLATION: Must JOIN users table to get real student names.");
+    }
+  }
+
+  // Require ORDER BY for ranking queries
+  if (context?.type === "ranking" && !upper.includes("ORDER BY") && (upper.includes("BEST") || upper.includes("TOP") || upper.includes("PERFORM"))) {
     issues.push("RULE VIOLATION: Must ORDER BY for ranking queries.");
   }
+
   if (/ORDER BY\s+[a-zA-Z0-9_]*\.?id\b/i.test(sql) && (upper.includes("BEST") || upper.includes("TOP") || upper.includes("PERFORM") || upper.includes("RANK"))) {
     issues.push("RULE VIOLATION: Cannot rank by user ID — must rank by calculated score!");
   }
+
   if (upper.includes("COURSE_WISE_SEGREGATIONS") && (upper.includes("PERFORMER") || upper.includes("RANK") || upper.includes("SCORE"))) {
     issues.push("RULE VIOLATION: Use actual {college}_{batch}_test_data tables for calculating rankings or scores, not course_wise_segregations.");
   }
+
   return issues;
 }
 
-// ── POST /chat ─────────────────────────────────────────────────────────────────
-agentRoutes.post("/chat", async (c) => {
-  let body: Record<string, any> = {};
-  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
+const responseCache = new Map<string, { report: string; sql: string | null; steps: number; ts: number }>();
 
-  const {
-    question, user_id, user_role, consoleId, openConsoles, history = [],
-  } = body as {
-    question?: string; user_id?: string | number; user_role?: string | number;
-    consoleId?: string; openConsoles?: any[]; history?: { role: 'user' | 'assistant', content: string }[];
-  };
+function preprocessQuestion(question: string): string {
+  let enhanced = question;
+  const lower = question.toLowerCase();
+  if (/who is|find user/i.test(lower)) {
+    const match = question.match(/who is (\w+)/i);
+    if (match) {
+      enhanced += `\n\nIMPORTANT: Search with WHERE name LIKE '%${match[1]}%' OR email LIKE '%${match[1]}%'. DO NOT use ORDER BY id LIMIT.`;
+    }
+  }
+  if (/marketplace/i.test(lower)) {
+    enhanced += `\n\nIMPORTANT: Marketplace = user_course_enrollments ONLY. NOT course_wise_segregations.`;
+  }
+  return enhanced;
+}
 
-  if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
+async function handleDbQuestion(
+  question: string,
+  userId: string,
+  userRole: string | number | undefined,
+  history: any[],
+  consoleId: string | undefined, // undefined for v2
+  options: { version: 'v1' | 'v2' }
+) {
+  const cacheKey = `${userId}:${question.toLowerCase().trim()}`;
+  const cached = responseCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 60_000) {
+    return { ...cached, cached: true };
+  }
 
-  const userId = user_id ? String(user_id) : "anonymous";
   const workspaceId = "000000000000000000000001";
   const chatModel = makeDeepSeekModel("deepseek-chat");
   const reasonerModel = makeDeepSeekModel("deepseek-reasoner");
   const route = preRouteQuestion(question.trim());
 
-  logger.info("Agent chat", { userId, route, question: question.slice(0, 80) });
+  logger.info(`Agent chat (${options.version})`, { userId, route, question: question.slice(0, 80) });
 
-  // ── GENERAL path — fast knowledge answer, no tools ────────────────────────
   if (route === "general") {
     try {
       const result = await generateText({
@@ -479,319 +506,22 @@ agentRoutes.post("/chat", async (c) => {
         ],
         temperature: 0.4,
       });
-      return c.json({ report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 });
+      return { report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      logger.error("General path error", { error: msg });
-      return c.json({ error: msg }, 500);
+      logger.error(`General path error (${options.version})`, { error: msg });
+      throw new Error(msg);
     }
   }
 
-  // ── DB path — manual tool loop (LLM decides which tools to call) ─────────
   try {
-    // Stage 1: Question Understanding (Intent Parsing via generateText + JSON parse)
-    const understandingResult = await generateText({
-      model: makeDeepSeekModel("deepseek-chat"),
-      system: `You are a JSON - only classifier.Output ONLY a valid JSON object, no markdown, no explanation.`,
-      messages: [{
-        role: "user" as const, content: `Analyze this user question about an educational database.
-Previous Chat Context(if any):
-${ history.map((h: any) => `${h.role}: ${h.content}`).join('\\n') || "None" }
-
-Current Question: "${question.trim()}"
-
-Return a JSON object with these fields:
-- "type": one of "ranking", "student_profile", "college_profile", "comparison", "count", "aggregation", "other"
-  - "college": specific college code(e.g. "srec", "mcet", "skcet") or "ALL" if comparing all
-    - "student": student name or roll number if mentioned, or null
-      - "needs_scores": true / false whether test_data or score computation is needed
-        - "limit": number if the question asks for top N, or null
-
-JSON only: ` }],
-      temperature: 0,
-    });
-
-    let questionContext: { type: string; college: string; student?: string; needs_scores: boolean; limit?: number } = {
-      type: "other", college: "ALL", needs_scores: true
-    };
-    try {
-      const raw = (understandingResult.text || "").replace(/```json ?\s * /gi, "").replace(/```/g, "").trim();
-      questionContext = JSON.parse(raw);
-    } catch (_parseErr) {
-      logger.warn("Failed to parse question context, using defaults", { text: understandingResult.text?.slice(0, 200) });
-    }
-    logger.info("Question Context Analyzed:", questionContext);
-
-    const liveSchema = await getFullSchemaPrompt();
-
-    let runtimeContext = `\n\nUser context: user_id = ${ user_id ?? "unknown" }, user_role = ${ user_role ?? "unknown" } (7 = Student, 4 = Staff, 5 = Trainer, 2 = Admin)`;
-    if (consoleId) runtimeContext += `\nActive console ID: ${ consoleId } `;
-
-    // Inject the parsed context into the AI's preamble so it knows EXACTLY what it's building
-    runtimeContext += `\n\nQUESTION INTENT ANALYSIS(from pre - parser): \n` + JSON.stringify(questionContext, null, 2);
-
-    // Phase 3, Step 4: Multi-Query Routing
-    let strategy = "";
-    switch (questionContext.type) {
-      case "count":
-        strategy = `STRATEGY: You MUST use a single, simple, combined SQL query! 
-        DO NOT use UNION ALL for count aggregations.DO NOT write 18 subqueries.DO NOT query every single table.
-  Example: SELECT(SELECT COUNT(*) FROM users WHERE role = 7 AND status = 1) AS total,
-    (SELECT COUNT(DISTINCT user_id) FROM course_wise_segregations WHERE user_role = 7 AND status = 1) AS enrolled; `;
-        break;
-      case "ranking":
-        strategy = "STRATEGY: You only need to run one big query using UNION ALL across all necessary college tables.";
-        break;
-      case "student_profile":
-        strategy = "STRATEGY: You MUST run multiple separate SQL queries to build a complete profile! \nQuery 1: Get student info from users AND user_academics \nQuery 2: Get test scores from {college}_test_data \nQuery 3: Calculate rank among college peers \nQuery 4: Get college average for comparison.";
-        break;
-      case "comparison":
-        strategy = "STRATEGY: Use a UNION ALL approach to compare colleges in a single query.";
-        break;
-      case "college_profile":
-        strategy = "STRATEGY: You MUST run multiple separate SQL queries to build a complete profile! \nQuery 1: Get college info and student count \nQuery 2: Get overall performance stats \nQuery 3: Get their top 5 students.";
-        break;
-    }
-    if (strategy) {
-      runtimeContext += `\n\nMULTI - QUERY ROUTING STRATEGY: \n${ strategy } `;
-    }
-
-    const systemPrompt = DB_SYSTEM_PREAMBLE + liveSchema + runtimeContext + findMatchingTemplate(question);
-
-    // Inline server-side tools — guaranteed execute functions (no client-side tools)
-    // This prevents the "Tool result is missing" error caused by client tools having no execute.
-    const dbName = process.env.DB_NAME || "coderv4";
-    const dbMock = { _id: "000000000000000000000002", type: "mysql" } as any;
-
-    const tools = {
-      list_tables: tool({
-        description: "List all tables in the database. Call this first if you aren't sure of table names.",
-        parameters: emptySchema,
-        execute: async () => {
-          console.log(`\n\n[AI TOOL / chat]list_tables() \n`);
-          const res = await databaseConnectionService.executeQuery(dbMock, "SHOW TABLES", { databaseName: dbName });
-          if (!res.success) return { error: res.error };
-          return { tables: (res.data || []).map((r: any) => Object.values(r)[0]) };
-        },
-      } as any),
-      describe_table: tool({
-        description: "Get the columns, data types, and a sample row of a specific table. Call before using any table you haven't seen.",
-        parameters: z.object({ table_name: z.string().optional().describe("Exact table name"), table: z.string().optional() }),
-        execute: async (args: { table_name?: string; table?: string }) => {
-          const tableName = args.table_name || args.table;
-          console.log(`\n\n[AI TOOL / chat]describe_table(${ tableName }) \n`);
-          if (!tableName) return { error: "table_name is required" };
-          const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-          const descRes = await databaseConnectionService.executeQuery(dbMock, `DESCRIBE \`${safe}\``, { databaseName: dbName });
-if (!descRes.success) return { error: descRes.error };
-const sampleRes = await databaseConnectionService.executeQuery(dbMock, `SELECT * FROM \`${safe}\` LIMIT 3`, { databaseName: dbName });
-return {
-  columns: descRes.data,
-  sample_data: sampleRes.success && sampleRes.data ? sampleRes.data : []
-};
-        },
-      } as any),
-get_course_allocations: tool({
-  description: "Find which college database prefixes (e.g. srec_2025_2) contain data for a specific course ID. ALWAYS use this before querying {college}_{batch}_coding_result or {college}_{batch}_mcq_result tables.",
-  parameters: z.object({ course_id: z.number().describe("The ID of the course") }),
-  execute: async ({ course_id }: { course_id: number }) => {
-    console.log(`\n\n[AI TOOL /chat] get_course_allocations(${course_id})\n`);
-    const query = `
-            SELECT 
-              cam.id as allocation_id, 
-              cam.course_id, 
-              cam.batch_id as batch,
-              c.college_short_name as college,
-              CONCAT(LOWER(REPLACE(c.college_short_name, ' ', '')), '_', cam.batch_id) as db_prefix
-            FROM course_academic_maps cam
-            JOIN colleges c ON c.id = cam.college_id
-            WHERE cam.course_id = ${Number(course_id)}
-          `;
-    const res = await databaseConnectionService.executeQuery(dbMock, query, { databaseName: dbName });
-    return res.success ? { allocations: res.data } : { error: res.error };
-  },
-} as any),
-  run_sql: tool({
-    description: "Execute a SQL SELECT query and return rows. Only SELECT allowed.",
-    parameters: z.object({ sql: z.string().optional().describe("SQL SELECT statement"), query: z.string().optional() }),
-    execute: async (args: { sql?: string; query?: string }) => {
-      const sql = args.sql || args.query || "";
-      console.log(`\n\n[AI TOOL /chat] run_sql: ${sql.slice(0, 100)}...\n`);
-      const cleaned = sql.trim().replace(/^```(sql)?\s*/i, "").replace(/\s*```$/i, "").trim();
-      if (!cleaned.toLowerCase().startsWith("select")) return { error: "Only SELECT queries are allowed." };
-
-      const issues = validateSQL(cleaned);
-      if (issues.length > 0) return { error: "SQL Rejected. Fix these issues: " + issues.join("; ") };
-
-      const res = await databaseConnectionService.executeQuery(dbMock, cleaned, { databaseName: dbName });
-      if (!res.success) return { error: res.error, sql: cleaned };
-
-      const data = res.data || [];
-      if (data.length === 0) {
-        return { error: "No rows returned. Please verify your table name, schema, or JOIN conditions.", sql: cleaned };
-      }
-
-      // Phase 3, Step 2: Verify Results based on intent
-      if (questionContext.type === "ranking") {
-        const columns = Object.keys(data[0] || {}).map(c => c.toLowerCase());
-        const hasScores = columns.some(c => c.includes('score') || c.includes('pct') || c.includes('mark') || c.includes('percent') || c.includes('total'));
-        if (!hasScores) {
-          return { error: "Validation Failed: Question asks for ranking, but the results lack score/percentage columns. You MUST calculate and SELECT scores. Fix your SQL and retry." };
-        }
-      }
-
-      if (questionContext.limit && data.length > (questionContext.limit * 2) && data.length > 5) {
-        return { error: `Validation Failed: You returned ${data.length} rows, but the question only asked for around ${questionContext.limit}. Use LIMIT or fix your groupings. Fix your SQL and retry.` };
-      }
-
-      if (questionContext.type === "student_profile") {
-        const columns = Object.keys(data[0] || {}).map(c => c.toLowerCase());
-        if (!columns.some(c => c.includes('name'))) {
-          return { error: "Validation Failed: This is a student profile question but there is no 'name' column in the results. Did you JOIN users? Fix your SQL and retry." };
-        }
-      }
-
-      // Guardrail: Check for unreasonable scores (> 100%)
-      const firstRow = data[0] || {};
-      const scoreWarnings: string[] = [];
-      for (const [key, val] of Object.entries(firstRow)) {
-        const lk = key.toLowerCase();
-        if ((lk.includes('pct') || lk.includes('percent') || lk.includes('percentage')) && typeof val === 'number' && val > 110) {
-          scoreWarnings.push(`${key}=${val} exceeds 100% — likely a calculation error`);
-        }
-      }
-      if (scoreWarnings.length > 0) {
-        return { error: `Validation Warning: ${scoreWarnings.join('; ')}. Check your SUM/divisor logic. Fix your SQL and retry.` };
-      }
-
-      return { rows: data.slice(0, 200), total: data.length, sql: cleaned };
-    },
-  } as any),
-    };
-
-// SDK v6: use stopWhen instead of manual tool loop — SDK handles message format internally
-const result = await generateText({
-  model: chatModel,
-  system: systemPrompt,
-  messages: [
-    ...(history as any),
-    { role: "user" as const, content: question.trim() }
-  ],
-  tools: tools as any,
-  stopWhen: stepCountIs(8),
-  temperature: 0,
-  onStepFinish: (step) => {
-    const trace = `\n[AI STEP] completed. Tool calls: ${JSON.stringify(step.toolCalls)}\nResults: ${JSON.stringify(step.toolResults)}\n`;
-    appendFileSync('ai_trace.log', trace);
-    logger.info(trace);
-  }
-});
-
-// Extract SQL and results from the SDK's internal steps
-let executedSql = "";
-const sqlResultsList: any[] = []; // Phase 3: Accumulate multiple datasets
-const stepsCount = result.steps?.length ?? 1;
-
-for (const step of result.steps ?? []) {
-  for (const tr of (step.toolResults ?? []) as any[]) {
-    const raw = tr.result ?? tr.output;
-    if (tr.toolName === "run_sql" && raw?.rows?.length > 0) {
-      sqlResultsList.push({ sql: raw.sql, data: raw.rows.slice(0, 100) });
-      executedSql += raw.sql + ";\n";
-    }
-  }
-}
-
-// If LLM answered from knowledge (no data returned), return its text directly
-if (sqlResultsList.length === 0 && result.text?.trim()) {
-  return c.json({ report: result.text.trim(), sql: executedSql || null, steps: stepsCount });
-}
-
-// ── Report generation pass (strictly bound to results) ───────────────────────
-let allDataJson = "";
-let totalRows = 0;
-sqlResultsList.forEach((res, i) => {
-  totalRows += res.data.length;
-  allDataJson += `\n\n--- Query ${i + 1} Results ---\nSQL: ${res.sql}\nDATA:\n${JSON.stringify(res.data, null, 2)}`;
-});
-
-const reportUserPrompt = `Question: "${question}"
-You ran ${sqlResultsList.length} queries returning a total of ${totalRows} rows.
-Here is the ACTUAL DATA you generated:
-${allDataJson.slice(0, 12000)}${allDataJson.length > 12000 ? "\n...(truncated to fit)" : ""}`;
-
-const reportResult = await generateText({
-  model: reasonerModel,
-  system: REPORT_SYSTEM_PROMPT,
-  messages: [{ role: "user" as const, content: reportUserPrompt }],
-  temperature: 0,
-});
-
-const finalReport = reportResult.text?.trim() || `## Results\n\n${allDataJson}`;
-const totalSteps = stepsCount + 1;
-
-logger.info("Agent chat complete", { userId, steps: totalSteps, sqlRows: totalRows });
-return c.json({ report: finalReport, sql: executedSql || null, steps: totalSteps });
-
-
-  } catch (err) {
-  const msg = err instanceof Error ? err.message : String(err);
-  logger.error("DB path error", { error: msg });
-  return c.json({ error: msg }, 500);
-}
-});
-
-// ── POST /chat-v2 — now with full parity: question understanding, strategy, verification ──
-agentRoutes.post("/chat-v2", async (c) => {
-  let body: Record<string, any> = {};
-  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
-
-  const { question, user_id, user_role, history = [] } = body as {
-    question?: string; user_id?: string | number; user_role?: string | number; history?: { role: 'user' | 'assistant', content: string }[];
-  };
-
-  if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
-
-  const userId = user_id ? String(user_id) : "anonymous";
-  const workspaceId = "000000000000000000000001";
-  const dbName = process.env.DB_NAME || "coderv4";
-  const dbMock = { _id: "000000000000000000000002", type: "mysql" } as any;
-  const chatModel = makeDeepSeekModel("deepseek-chat");
-  const reasonerModel = makeDeepSeekModel("deepseek-reasoner");
-  const route = preRouteQuestion(question.trim());
-
-  logger.info("Agent chat-v2", { userId, route, question: question.slice(0, 80) });
-
-  // ── GENERAL path — fast knowledge answer, no tools ────────────────────────
-  if (route === "general") {
-    try {
-      const result = await generateText({
-        model: reasonerModel,
-        system: GENERAL_KNOWLEDGE_PROMPT,
-        messages: [
-          ...(history as any),
-          { role: "user" as const, content: question.trim() }
-        ],
-        temperature: 0.4,
-      });
-      return c.json({ report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.error("General path error (v2)", { error: msg });
-      return c.json({ error: msg }, 500);
-    }
-  }
-
-  // ── DB path ─────────────────────────────────────────────────────────────────
-  try {
-    // Stage 1: Question Understanding (same as /chat)
     const understandingResult = await generateText({
       model: makeDeepSeekModel("deepseek-chat"),
       system: `You are a JSON-only classifier. Output ONLY a valid JSON object, no markdown, no explanation.`,
       messages: [{
         role: "user" as const, content: `Analyze this user question about an educational database.
 Previous Chat Context (if any):
-${history.map((h: any) => `${h.role}: ${h.content}`).join('\\n') || "None"}
+${history.map((h: any) => `${h.role}: ${h.content}`).join('\n') || "None"}
 
 Current Question: "${question.trim()}"
 
@@ -813,16 +543,22 @@ JSON only:` }],
       const raw = (understandingResult.text || "").replace(/```json?\s*/gi, "").replace(/```/g, "").trim();
       questionContext = JSON.parse(raw);
     } catch (parseErr) {
-      logger.warn("Failed to parse question context (v2), using defaults", { text: understandingResult.text?.slice(0, 200) });
+      logger.warn(`Failed to parse question context (${options.version}), using defaults`, { text: understandingResult.text?.slice(0, 200) });
     }
-    logger.info("Question Context Analyzed (v2):", questionContext);
+    logger.info(`Question Context Analyzed (${options.version}):`, questionContext);
 
-    const liveSchema = await getFullSchemaPrompt();
+    let liveSchema = "";
+    try {
+      liveSchema = await getFullSchemaPrompt();
+    } catch (err) {
+      logger.warn("Failed to fetch live schema, continuing with preamble only", { error: err });
+    }
 
-    let runtimeContext = `\n\nUser context: user_id = ${user_id ?? "unknown"}, user_role = ${user_role ?? "unknown"} (7 = Student, 4 = Staff, 5 = Trainer, 2 = Admin)`;
+    let runtimeContext = `\n\nUser context: user_id = ${userId}, user_role = ${userRole ?? "unknown"} (7 = Student, 4 = Staff, 5 = Trainer, 2 = Admin)`;
+    if (consoleId) runtimeContext += `\nActive console ID: ${consoleId}`;
+
     runtimeContext += `\n\nQUESTION INTENT ANALYSIS (from pre-parser):\n` + JSON.stringify(questionContext, null, 2);
 
-    // Multi-Query Routing
     let strategy = "";
     switch (questionContext.type) {
       case "count":
@@ -850,12 +586,15 @@ JSON only:` }],
 
     const systemPrompt = DB_SYSTEM_PREAMBLE + liveSchema + runtimeContext + findMatchingTemplate(question);
 
+    const dbName = process.env.DB_NAME || "coderv4";
+    const dbMock = { _id: "000000000000000000000002", type: "mysql" } as any;
+
     const tools = {
       list_tables: tool({
         description: "List all tables in the database.",
         parameters: emptySchema,
         execute: async () => {
-          console.log(`\n\n[AI TOOL /chat-v2] list_tables()\n`);
+          console.log(`\n\n[AI TOOL /chat-${options.version}] list_tables()\n`);
           const res = await databaseConnectionService.executeQuery(dbMock, "SHOW TABLES", { databaseName: dbName });
           return res.success ? { tables: res.data?.map((r: any) => Object.values(r)[0]) || [] } : { error: res.error };
         },
@@ -865,7 +604,7 @@ JSON only:` }],
         parameters: z.object({ table_name: z.string().optional(), table: z.string().optional() }),
         execute: async (args: { table_name?: string; table?: string }) => {
           const tableName = args.table_name || args.table;
-          console.log(`\n\n[AI TOOL /chat-v2] describe_table(${tableName})\n`);
+          console.log(`\n\n[AI TOOL /chat-${options.version}] describe_table(${tableName})\n`);
           if (!tableName) return { error: "table_name is required" };
           const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
           const descRes = await databaseConnectionService.executeQuery(dbMock, `DESCRIBE \`${safe}\``, { databaseName: dbName });
@@ -881,17 +620,20 @@ JSON only:` }],
         description: "Find which college database prefixes (e.g. srec_2025_2) contain data for a specific course ID.",
         parameters: z.object({ course_id: z.number() }),
         execute: async ({ course_id }: { course_id: number }) => {
-          console.log(`\n\n[AI TOOL /chat-v2] get_course_allocations(${course_id})\n`);
+          console.log(`\n\n[AI TOOL /chat-${options.version}] get_course_allocations(${course_id})\n`);
           const query = `
             SELECT 
               cam.id as allocation_id, 
-              cam.course_id, 
-              cam.batch_id as batch,
-              c.college_short_name as college,
-              CONCAT(LOWER(REPLACE(c.college_short_name, ' ', '')), '_', cam.batch_id) as db_prefix
+              cam.course_id,
+              cam.db as db_prefix,
+              cam.topic_name,
+              c.college_name,
+              c.college_short_name as college
             FROM course_academic_maps cam
             JOIN colleges c ON c.id = cam.college_id
             WHERE cam.course_id = ${Number(course_id)}
+              AND cam.status = 1
+            GROUP BY cam.db, cam.topic_name, c.college_name, c.college_short_name
           `;
           const res = await databaseConnectionService.executeQuery(dbMock, query, { databaseName: dbName });
           return res.success ? { allocations: res.data } : { error: res.error };
@@ -902,11 +644,11 @@ JSON only:` }],
         parameters: z.object({ sql: z.string().optional(), query: z.string().optional() }),
         execute: async (args: { sql?: string; query?: string }) => {
           const sql = args.sql || args.query || "";
-          console.log(`\n\n[AI TOOL /chat-v2] run_sql: ${sql.slice(0, 100)}...\n`);
+          console.log(`\n\n[AI TOOL /chat-${options.version}] run_sql: ${sql.slice(0, 100)}...\n`);
           const cleaned = sql.trim().replace(/^```(sql)?\s*/i, "").replace(/\s*```$/i, "").trim();
           if (!cleaned.toLowerCase().startsWith("select")) return { error: "Only SELECT queries allowed" };
 
-          const issues = validateSQL(cleaned);
+          const issues = validateSQL(cleaned, questionContext);
           if (issues.length > 0) return { error: "SQL Rejected. Fix these issues: " + issues.join("; ") };
 
           const res = await databaseConnectionService.executeQuery(dbMock, cleaned, { databaseName: dbName });
@@ -917,7 +659,6 @@ JSON only:` }],
             return { error: "No rows returned. Please verify your table name, schema, or JOIN conditions.", sql: cleaned };
           }
 
-          // Full verification (parity with /chat)
           if (questionContext.type === "ranking") {
             const columns = Object.keys(data[0] || {}).map(c => c.toLowerCase());
             const hasScores = columns.some(c => c.includes('score') || c.includes('pct') || c.includes('mark') || c.includes('percent') || c.includes('total'));
@@ -937,7 +678,6 @@ JSON only:` }],
             }
           }
 
-          // Score range guardrail
           const firstRow = data[0] || {};
           const scoreWarnings: string[] = [];
           for (const [key, val] of Object.entries(firstRow)) {
@@ -955,48 +695,108 @@ JSON only:` }],
       } as any),
     };
 
-    // SDK v6: stopWhen handles the full tool loop internally
-    const result = await generateText({
-      model: chatModel,
-      system: systemPrompt,
-      messages: [
-        ...(history as any),
-        { role: "user" as const, content: question.trim() }
-      ],
-      tools,
-      stopWhen: stepCountIs(8),
-      temperature: 0,
-      onStepFinish: (step) => {
-        const trace = `\n[AI STEP v2] completed. Tool calls: ${JSON.stringify(step.toolCalls)}\nResults: ${JSON.stringify(step.toolResults)}\n`;
-        require('fs').appendFileSync('ai_trace.log', trace);
-        logger.info(trace);
-      }
-    });
-
-    // Extract SQL and results (accumulate multiple datasets like /chat)
     let executedSql = "";
     let sqlResultsList: any[] = [];
-    const stepsCount = result.steps?.length ?? 1;
+    let stepsCount = 0;
+    const TIMEOUT_MS = 30_000;
 
-    for (const step of result.steps ?? []) {
-      for (const tr of (step.toolResults ?? []) as any[]) {
-        const raw = tr.result ?? tr.output;
-        if (tr.toolName === "run_sql" && raw?.rows?.length > 0) {
-          sqlResultsList.push({ sql: raw.sql, data: raw.rows.slice(0, 100) });
-          executedSql += raw.sql + ";\n";
+    const messagesArray = [
+      ...(history as any),
+      { role: "user" as const, content: preprocessQuestion(question.trim()) }
+    ];
+
+    if (options.version === 'v1') {
+      let isComplete = false;
+      const coreMessages = [...messagesArray];
+
+      while (stepsCount < 8 && !isComplete) {
+        stepsCount++;
+
+        const resultPromise = generateText({
+          model: chatModel,
+          system: systemPrompt,
+          messages: coreMessages,
+          tools,
+          temperature: 0,
+        });
+
+        const result = await Promise.race([
+          resultPromise,
+          new Promise<any>((_, reject) =>
+            setTimeout(() => reject(new Error("Agent timed out after 30s")), TIMEOUT_MS)
+          )
+        ]);
+
+        coreMessages.push(result.response.messages[0]);
+        const toolCalls = result.toolCalls || [];
+
+        if (toolCalls.length === 0) {
+          isComplete = true;
+          if (sqlResultsList.length === 0 && result.text?.trim()) {
+            return { report: result.text.trim(), sql: null, steps: stepsCount };
+          }
+          break;
         }
+
+        const toolResults = await Promise.all(toolCalls.map(async (call: any) => {
+          let toolRes;
+          try {
+            toolRes = await (tools as any)[call.toolName].execute(call.args);
+          } catch (e) {
+            toolRes = { error: String(e) };
+          }
+          if (call.toolName === "run_sql" && !toolRes.error && toolRes.rows) {
+            sqlResultsList.push({ sql: (call.args as any).sql || (call.args as any).query, data: toolRes.rows.slice(0, 100) });
+            executedSql += ((call.args as any).sql || (call.args as any).query) + ";\n";
+          }
+          return { toolCallId: call.toolCallId, result: toolRes };
+        }));
+
+        coreMessages.push({ role: "tool", content: toolResults as any });
+      }
+    } else {
+      const resultPromise = generateText({
+        model: chatModel,
+        system: systemPrompt,
+        messages: messagesArray,
+        tools,
+        stopWhen: stepCountIs(8),
+        temperature: 0,
+        onStepFinish: (step) => {
+          const trace = `\n[AI STEP v2] completed. Tool calls: ${JSON.stringify(step.toolCalls)}\nResults: ${JSON.stringify(step.toolResults)}\n`;
+          require('fs').appendFileSync('ai_trace.log', trace);
+          logger.info(trace);
+        }
+      });
+
+      const result = await Promise.race([
+        resultPromise,
+        new Promise<any>((_, reject) =>
+          setTimeout(() => reject(new Error("Agent timed out after 30s")), TIMEOUT_MS)
+        )
+      ]);
+
+      stepsCount = result.steps?.length ?? 1;
+
+      for (const step of result.steps ?? []) {
+        for (const tr of (step.toolResults ?? []) as any[]) {
+          const raw = tr.result ?? tr.output;
+          if (tr.toolName === "run_sql" && raw?.rows?.length > 0) {
+            sqlResultsList.push({ sql: raw.sql, data: raw.rows.slice(0, 100) });
+            executedSql += raw.sql + ";\n";
+          }
+        }
+      }
+
+      if (sqlResultsList.length === 0 && result.text?.trim()) {
+        return { report: result.text.trim(), sql: null, steps: stepsCount };
       }
     }
 
-    if (sqlResultsList.length === 0 && result.text?.trim()) {
-      return c.json({ report: result.text.trim(), sql: null, steps: stepsCount });
-    }
-
-    // Report generation (same as /chat)
     let allDataJson = "";
     let totalRows = 0;
     sqlResultsList.forEach((res, i) => {
-      totalRows += res.data.length;
+      totalRows += res.data?.length || 0;
       allDataJson += `\n\n--- Query ${i + 1} Results ---\nSQL: ${res.sql}\nDATA:\n${JSON.stringify(res.data, null, 2)}`;
     });
 
@@ -1005,7 +805,7 @@ You ran ${sqlResultsList.length} queries returning a total of ${totalRows} rows.
 Here is the ACTUAL DATA you generated:
 ${allDataJson.slice(0, 12000)}${allDataJson.length > 12000 ? "\n...(truncated to fit)" : ""}`;
 
-    const reportResult = await generateText({
+    const reportResultPromise = generateText({
       model: reasonerModel,
       system: REPORT_SYSTEM_PROMPT,
       messages: [
@@ -1015,15 +815,66 @@ ${allDataJson.slice(0, 12000)}${allDataJson.length > 12000 ? "\n...(truncated to
       temperature: 0,
     });
 
+    const reportResult = await Promise.race([
+      reportResultPromise,
+      new Promise<any>((_, reject) =>
+        setTimeout(() => reject(new Error("Agent timed out after 30s")), TIMEOUT_MS)
+      )
+    ]);
+
     const finalReport = reportResult.text?.trim() || `## Results\n\n${allDataJson}`;
     const totalSteps = stepsCount + 1;
 
-    logger.info("Agent chat-v2 complete", { userId, steps: totalSteps, sqlRows: totalRows });
-    return c.json({ report: finalReport, sql: executedSql || null, steps: totalSteps });
+    logger.info(`Agent chat complete (${options.version})`, { userId, steps: totalSteps, sqlRows: totalRows });
+
+    const responsePayload = { report: finalReport, sql: executedSql || null, steps: totalSteps };
+    responseCache.set(cacheKey, { ...responsePayload, ts: Date.now() });
+    return responsePayload;
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error("Agent chat-v2 error", { error: msg });
-    return c.json({ error: msg }, 500);
+    logger.error(`DB path error (${options.version})`, { error: msg });
+    throw new Error(msg);
+  }
+}
+
+// ── POST /chat ─────────────────────────────────────────────────────────────────
+agentRoutes.post("/chat", async (c) => {
+  let body: Record<string, any> = {};
+  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
+
+  const { question, user_id, user_role, consoleId, history = [] } = body as {
+    question?: string; user_id?: string | number; user_role?: string | number;
+    consoleId?: string; history?: { role: 'user' | 'assistant', content: string }[];
+  };
+
+  if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
+  const userId = user_id ? String(user_id) : "anonymous";
+
+  try {
+    const response = await handleDbQuestion(question, userId, user_role, history, consoleId, { version: 'v1' });
+    return c.json(response);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
+});
+
+// ── POST /chat-v2 ──────────────────────────────────────────────────────────────
+agentRoutes.post("/chat-v2", async (c) => {
+  let body: Record<string, any> = {};
+  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
+
+  const { question, user_id, user_role, history = [] } = body as {
+    question?: string; user_id?: string | number; user_role?: string | number; history?: { role: 'user' | 'assistant', content: string }[];
+  };
+
+  if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
+  const userId = user_id ? String(user_id) : "anonymous";
+
+  try {
+    const response = await handleDbQuestion(question, userId, user_role, history, undefined, { version: 'v2' });
+    return c.json(response);
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
   }
 });
