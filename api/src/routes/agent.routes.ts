@@ -26,7 +26,6 @@ import { getFullSchemaPrompt } from "../agent-lib/tools/shared/schema-cache";
 import { loggers } from "../logging";
 import { getSmartRegistryContext } from "../agent-lib/smart-registry";
 import { findMatchingTemplate } from "../agent-lib/query-templates";
-import { PLACEMENT_SYSTEM_PROMPT } from "../agent-lib/placement-knowledge";
 
 // DeepSeek + AI SDK require at least one property in tool parameter schemas.
 // An empty z.object({}) causes "Invalid prompt: messages do not match ModelMessage[] schema".
@@ -94,7 +93,7 @@ agentRoutes.use("/chat", async (c, next) => {
 // ── Pre-router: classify question WITHOUT calling the LLM ────────────────────
 // Returns "general" → answer from knowledge, no DB access needed
 // Returns "db"      → needs real data from TiDB, use tools
-function preRouteQuestion(q: string): "general" | "db" | "greeting" | "placement" {
+function preRouteQuestion(q: string): "general" | "db" | "greeting" {
   const lower = q.toLowerCase().trim();
 
   // ── Signals for greeting ──
@@ -103,7 +102,7 @@ function preRouteQuestion(q: string): "general" | "db" | "greeting" | "placement
   ];
   if (greetingPatterns.some(p => p.test(lower))) return "greeting";
 
-  // ── Signals for placement/eligibility questions ──
+  // ── Signals for placement/eligibility questions (route to DB for real data) ──
   const placementPatterns = [
     /\beligib(le|ility)\b/, /\bplacement\b/, /\bcampus (drive|hiring|recruit)\b/,
     /\bhiring\b/, /\brecruit(ment|ing)?\b/, /\bpackage\b/, /\bsalary\b/, /\blpa\b/,
@@ -116,7 +115,7 @@ function preRouteQuestion(q: string): "general" | "db" | "greeting" | "placement
     /which compan(y|ies) (can i|am i|i can)/,
     /\bcan i (get into|apply|join)\b/,
   ];
-  if (placementPatterns.some(p => p.test(lower))) return "placement";
+  if (placementPatterns.some(p => p.test(lower))) return "db";
 
   // ── Signals that are clearly advice/general knowledge (check FIRST) ──
   const advicePatterns = [
@@ -403,6 +402,95 @@ IMPORTANT: When asked about topics/subtopics of a course, query ALL rows — do 
 5. total_mark JSON can have 0 — use NULLIF to avoid division by zero
 6. status=2 means inactive — always filter status=1
 7. course_academic_maps.db column tells which test tables to use
+
+## 🏢 COMPANY ELIGIBILITY QUESTIONS (AI-POWERED — NO LOOKUP TABLE)
+
+When user asks "Who is eligible for {Company}?" or "{Company} interview eligible students":
+
+### STEP 1: USE YOUR KNOWLEDGE FOR CRITERIA
+You already know standard Indian campus hiring cutoffs for 200+ companies.
+Apply your knowledge: 10th %, 12th %, UG CGPA, backlogs, coding focus level.
+
+### STEP 2: ALSO ANALYSE PLATFORM PERFORMANCE FROM DB
+Student academic data: user_academics.academic_info JSON
+  - $.tenth, $.twelth, $.ug, $.current_backlogs, $.backlogs_history
+  - Values are STRINGS ("85", "7.8") — use JSON_UNQUOTE + CAST
+  - "0" means NOT FILLED — EXCLUDE with != '0'
+
+Student coding/MCQ performance: UNION ALL across test_data tables
+  - mark JSON: {co, mcq, pro} and total_mark JSON: {co, mcq, pro}
+  - topic_type: 0=practice, 1=test/assessment
+  - Calculate: SUM(co)*100/NULLIF(SUM(co_total),0) for coding %
+
+### STEP 3: SQL TEMPLATE — Use this exact pattern
+\`\`\`sql
+WITH all_test_data AS (
+    SELECT user_id, JSON_EXTRACT(mark,'$.co') AS co, JSON_EXTRACT(mark,'$.mcq') AS mcq, JSON_EXTRACT(total_mark,'$.co') AS co_total, JSON_EXTRACT(total_mark,'$.mcq') AS mcq_total, topic_type FROM srec_2025_2_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM srec_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM skct_2025_2_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM skcet_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM mcet_2025_2_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM mcet_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM niet_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM nit_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM ciet_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM kits_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM kclas_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM mec_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM jpc_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM demolab_2025_2_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM demolab_2026_1_test_data WHERE status=1
+    UNION ALL SELECT user_id, JSON_EXTRACT(mark,'$.co'), JSON_EXTRACT(mark,'$.mcq'), JSON_EXTRACT(total_mark,'$.co'), JSON_EXTRACT(total_mark,'$.mcq'), topic_type FROM b2c_test_data WHERE status=1
+),
+student_performance AS (
+    SELECT user_id,
+        ROUND(SUM(co)*100.0/NULLIF(SUM(co_total),0),2) AS overall_coding_pct,
+        ROUND(SUM(mcq)*100.0/NULLIF(SUM(mcq_total),0),2) AS overall_mcq_pct,
+        ROUND(SUM(CASE WHEN topic_type=1 THEN co ELSE 0 END)*100.0/NULLIF(SUM(CASE WHEN topic_type=1 THEN co_total ELSE 0 END),0),2) AS assessment_coding_pct,
+        COUNT(*) AS modules_attempted,
+        SUM(CASE WHEN topic_type=1 THEN 1 ELSE 0 END) AS assessments_attempted
+    FROM all_test_data GROUP BY user_id
+)
+SELECT u.id AS user_id, u.name AS student_name, col.college_name, d.department_name,
+    CAST(JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.tenth')) AS DECIMAL(5,2)) AS tenth_pct,
+    CAST(JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.twelth')) AS DECIMAL(5,2)) AS twelth_pct,
+    CAST(JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.ug')) AS DECIMAL(5,2)) AS ug_score,
+    sp.overall_coding_pct, sp.overall_mcq_pct, sp.assessment_coding_pct,
+    sp.modules_attempted, sp.assessments_attempted
+FROM users u
+JOIN user_academics ua ON ua.user_id = u.id AND ua.status = 1
+LEFT JOIN colleges col ON col.id = ua.college_id
+LEFT JOIN departments d ON d.id = ua.department_id
+JOIN student_performance sp ON sp.user_id = u.id
+WHERE u.role = 7 AND u.status = 1
+  AND ua.academic_info IS NOT NULL
+  AND JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.tenth')) != '0'
+  AND JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.twelth')) != '0'
+  AND CAST(JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.tenth')) AS DECIMAL(5,2)) >= {TENTH_MIN}
+  AND CAST(JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.twelth')) AS DECIMAL(5,2)) >= {TWELTH_MIN}
+  AND CAST(JSON_UNQUOTE(JSON_EXTRACT(ua.academic_info,'$.current_backlogs')) AS UNSIGNED) <= {BACKLOGS_MAX}
+  AND sp.overall_coding_pct >= {CODING_MIN}
+ORDER BY sp.overall_coding_pct DESC, col.college_name
+LIMIT 500;
+\`\`\`
+
+### STEP 4: COMPANY PERFORMANCE THRESHOLDS (use your knowledge)
+| Company Type | Coding Min % | Notes |
+|---|---|---|
+| Zoho, Google, Microsoft | >= 60% | Heavy coding rounds |
+| Amazon, Flipkart, PayPal | >= 60% | DSA + system design |
+| TCS, Infosys, Wipro, Cognizant | >= 40% | Aptitude-focused |
+| Freshworks, Swiggy | >= 55% | Balanced |
+
+### STEP 5: REPORT FORMAT
+ALWAYS include in the report:
+1. "Applying {Company} eligibility: Academic: 10th≥X%, 12th≥Y%, Backlogs=0 | Platform: Coding≥Z%"
+2. Table of eligible students (name, college, department, 10th, 12th, coding%, mcq%)
+3. Sort by overall_coding_pct DESC (best coders first)
+4. Summary: "X students eligible out of Y total"
+
+### IF UNKNOWN COMPANY:
+Reply: "I don't have eligibility criteria for {Company}. Please provide: min 10th%, 12th%, UG CGPA, backlog rules, and coding threshold."
 ` + getSmartRegistryContext();
 
 // ── Report generation system prompt (dynamic word budget) ─────────────────────
@@ -521,6 +609,15 @@ function preprocessQuestion(question: string): string {
   if (/marketplace/i.test(lower)) {
     enhanced += `\n\nIMPORTANT: Marketplace = user_course_enrollments ONLY. NOT course_wise_segregations.`;
   }
+  // Company eligibility hint
+  if (/\b(eligible|eligibility|placement|interview)\b/i.test(lower)) {
+    enhanced += `\n\nIMPORTANT: This is a COMPANY ELIGIBILITY question. Follow the eligibility template in the preamble:
+1. Use YOUR KNOWLEDGE for this company's academic cutoffs (10th, 12th, backlogs)
+2. Use the all_test_data CTE to get platform coding/MCQ scores
+3. Combine BOTH academic + platform criteria
+4. Show criteria used in the report
+5. Sort by coding score DESC`;
+  }
   return enhanced;
 }
 
@@ -549,25 +646,6 @@ async function handleDbQuestion(
     const greetingMsg = `## 🤖 Devora AI Assistant\n**Always here to help**\n\nHello! I'm **Devora AI Assistant** — your intelligent database insights system for an online coding education platform.\n\n### 📊 Smart Insights I Can Provide:\n\n- 🔍 **Student Performance Analytics** — Scores, rankings, trends & anomaly detection\n- 🏆 **Cross-College Benchmarking** — Compare colleges, departments & batches side-by-side\n- 📈 **Progress & Trend Analysis** — Track improvement across semesters\n- 🎓 **Course Insights** — Enrollment patterns, completion rates & topic breakdowns\n- 🎯 **Actionable Intelligence** — Top performers, at-risk students & course effectiveness\n- 🔗 **Deep Drill-Down** — From platform overview → college → department → student\n\n### 💡 Try asking me:\n- *"Show me a performance comparison across all colleges"*\n- *"Who are the top 10 students in SREC?"*\n- *"What courses have the highest enrollment?"*\n- *"Give me a complete overview of SKCET"*\n\nWhat insights would you like to explore today?`;
 
     return { report: greetingMsg, sql: null, steps: 0 };
-  }
-
-  if (route === "placement") {
-    try {
-      const result = await generateText({
-        model: reasonerModel,
-        system: PLACEMENT_SYSTEM_PROMPT,
-        messages: [
-          ...(history as any),
-          { role: "user" as const, content: question.trim() + `\n\nUser context: user_id = ${userId}, user_role = ${userRole ?? "unknown"}` }
-        ],
-        temperature: 0.3,
-      });
-      return { report: result.text?.trim() || "I couldn't generate placement advice.", sql: null, steps: 1 };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.error(`Placement path error (${options.version})`, { error: msg });
-      throw new Error(msg);
-    }
   }
 
   if (route === "general") {
@@ -601,7 +679,7 @@ ${history.map((h: any) => `${h.role}: ${h.content}`).join('\n') || "None"}
 Current Question: "${question.trim()}"
 
 Return a JSON object with these fields:
-- "type": one of "ranking", "student_profile", "college_profile", "comparison", "count", "aggregation", "other"
+- "type": one of "ranking", "student_profile", "college_profile", "comparison", "count", "aggregation", "eligibility", "other"
 - "college": specific college code (e.g. "srec", "mcet", "skcet") or "ALL" if comparing all
 - "student": student name or roll number if mentioned, or null
 - "needs_scores": true/false whether test_data or score computation is needed
@@ -653,6 +731,12 @@ JSON only:` }],
         break;
       case "college_profile":
         strategy = "STRATEGY: You MUST run multiple separate SQL queries to build a complete profile! \nQuery 1: Get college info and student count \nQuery 2: Get overall performance stats \nQuery 3: Get their top 5 students.";
+        break;
+      case "eligibility":
+        strategy = `STRATEGY: Use the COMPANY ELIGIBILITY template from preamble.
+CTE with UNION ALL across ALL test_data tables → student_performance →
+JOIN with user_academics for academic marks → filter by company criteria.
+Use YOUR KNOWLEDGE for the company's cutoffs (10th, 12th, backlogs, coding threshold).`;
         break;
     }
     if (strategy) {
