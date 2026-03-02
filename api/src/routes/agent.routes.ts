@@ -274,7 +274,22 @@ category: 1=Basic, 2=Intermediate, 3=Professional
 db column (e.g., "demolab_2025_2") tells which test tables to query.
 test_data.topic_test_id maps to course_academic_maps.id
 
-### 10. SUPPORTING TABLES
+### 10. COURSE STRUCTURE — How topics/subtopics are organized inside a course
+- courses: id, course_name, course_short_name, category
+- titles: id, course_id, title (= SUBTOPIC SECTION name like "MATERIAL", "HIBERNATE ORM, JPA...", "Practice", "PROJECT")
+- course_topic_maps: id, course_id, title_id, topic_id, topic_order
+- topics: id, topic_name, category
+
+JOIN PATH for "what topics/subtopics does course X have?":
+  courses → titles (subtopic sections) → course_topic_maps (links) → topics (individual topics)
+  SQL: SELECT t.title, tp.topic_name, ctm.topic_order
+       FROM titles t
+       JOIN course_topic_maps ctm ON ctm.title_id = t.id AND ctm.course_id = t.course_id
+       JOIN topics tp ON tp.id = ctm.topic_id
+       WHERE t.course_id = <ID>
+       ORDER BY t.id, ctm.topic_order
+
+### 11. SUPPORTING TABLES
 - user_academics: user_id → college_id, department_id, batch_id, section_id
 - batches: batch_name (e.g., "2023-2027"), college_id
 - departments: department_name, department_short_name
@@ -283,22 +298,22 @@ test_data.topic_test_id maps to course_academic_maps.id
 - institutions: institution_name (SKG, SRG, Nehru)
 - topics (675 rows): topic_name, category
 
-### 11. FEEDBACK SYSTEM
+### 12. FEEDBACK SYSTEM
 - staff_trainer_feedback (22,396 rows): user_id, course_id, staff_trainer_id, question_id, feedback(1-5)
 - portal_feedback (6,060 rows): user_id, question_id, feedback(1-5), type
 - feedback_questions: "Overall Experience", "Ease of Use", "Content Quality", "Speed", "Helpfulness"
 - feedback_allocations: Links feedback to college/dept/batch/section
 
-### 12. CERTIFICATES
+### 13. CERTIFICATES
 - certificates: Templates with {{college}}, {{course}}, {{department}} placeholders
 - verify_certificates (12,145 rows): roll_number, name, c_certificate(ID like "AMY20240415136")
 
-### 13. DISCUSSIONS & AI
+### 14. DISCUSSIONS & AI
 - discussions (185), discussion_messages (383): Forum threads per course/topic
 - a_i_high_lights: AI explanations for study materials
 - ai_prompts: System prompts for code formatting, evaluation
 
-### 14. ACTIVITY TRACKING
+### 15. ACTIVITY TRACKING
 - 2025_submission_tracks, 2026_submission_tracks: Daily attended/solved counts as JSON by date
 - testpage_user_tracks (3,390): User behavior during tests
 - user_login_activities: ip_address, browser, os, device per login
@@ -320,6 +335,9 @@ colleges.id = course_academic_maps.college_id
 departments.id = user_academics.department_id
 courses.id = course_wise_segregations.course_id
 courses.id = course_academic_maps.course_id
+courses.id = titles.course_id
+titles.id = course_topic_maps.title_id
+course_topic_maps.topic_id = topics.id
 course_academic_maps.id = {college}_test_data.topic_test_id
 topics.id = course_academic_maps.topic_id
 course_wise_segregations.course_allocation_id = user_course_enrollments.course_allocation_id
@@ -337,6 +355,8 @@ COMBINE SEMESTERS: UNION ALL {college}_2025_2 and {college}_2026_1
 TOPIC SCORES: JOIN test_data.topic_test_id = course_academic_maps.id
 FEEDBACK: JOIN staff_trainer_feedback + feedback_questions
 CERTIFICATES: verify_certificates WHERE status = 1
+COURSE STRUCTURE: courses → titles → course_topic_maps → topics (use JOIN, ORDER BY title, topic_order)
+IMPORTANT: When asked about topics/subtopics of a course, query ALL rows — do NOT use LIMIT
 
 ## ⚠️ GOTCHAS
 
@@ -372,10 +392,13 @@ const REPORT_SYSTEM_PROMPT = `You are a data analyst.Generate a brief report fro
    ❌ "Here are the results for your question! The query is ready in the console."(Just answer directly)
 5. ANSWER ONLY WHAT WAS ASKED
   - If user asks for count, give count + table + 3 insights.Do not add extra fluff.
-6. KEEP IT SHORT
-  - Maximum 150 words
+6. KEEP IT FOCUSED
+  - Maximum 500 words
     - If the answer is a single number, say it in ONE line
       - Users want ANSWERS, not essays
+7. PRESENT ALL DATA ROWS — NEVER summarize or truncate rows from the query results
+  - If there are 23 rows, show ALL 23 in the table
+    - Group by category/section if applicable
 ## EXAMPLE — Good Report:
 Question: "How many students are there?"
 Data: [{ total: 4021 }, { enrolled: 3132 }, { with_academics: 3728 }]
