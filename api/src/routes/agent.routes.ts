@@ -182,7 +182,7 @@ const DB_SYSTEM_PREAMBLE = `You are a Database Console Assistant for Mako — an
 2. MARKETPLACE = user_course_enrollments table ONLY (NOT course_wise_segregations)
 3. ALWAYS filter status = 1 for active records
 4. MARKS are JSON: use JSON_EXTRACT(mark, '$.co') for coding scores
-5. Student role = 7. Staff role = 4. Developer role = 5. Admin role = 1.
+5. Student role = 7. Staff role = 4. Trainer role = 5. Admin role = 2. College Admin role = 3. Super Admin role = 1.
 6. SELF-REFERENCE: When user says "I", "me", "my", "mine", always use the user_id from User Context below.
    Example: "how many courses I enrolled?" → WHERE user_id = {user_id from context}
    Example: "show my scores" → WHERE user_id = {user_id from context}
@@ -198,7 +198,7 @@ const DB_SYSTEM_PREAMBLE = `You are a Database Console Assistant for Mako — an
 | 1341 | Muruganantham     | muruganantham@amypo.in          | 5    | NULL          | 1      |
 | 2876 | FARA FATHIMA I    | farafathima.2301055@srec.ac.in  | 7    | 71812301055   | 1      |
 
-ROLE CODES: 1=Super Admin, 2=Admin, 3=Manager, 4=Staff/Trainer, 5=Developer/Team, 6=Support/QA, 7=Student
+ROLE CODES: 1=Super Admin, 2=Admin, 3=College Admin, 4=Staff, 5=Trainer, 6=Content, 7=Student
 STATUS CODES: 1=Active, 2=Inactive/Suspended
 PATTERNS:
 - AMYPO staff: @amypo.in or @amypo.com, roles 1-6, no roll_no
@@ -571,7 +571,7 @@ JSON only:` }],
       logger.warn("Failed to fetch live schema, continuing with preamble only", { error: err });
     }
 
-    let runtimeContext = `\n\nUser context: user_id = ${userId}, user_role = ${userRole ?? "unknown"} (7 = Student, 4 = Staff, 5 = Trainer, 2 = Admin)`;
+    let runtimeContext = `\n\nUser context: user_id = ${userId}, user_role = ${userRole ?? "unknown"} (1=Super Admin, 2=Admin, 3=College Admin, 4=Staff, 5=Trainer, 6=Content, 7=Student)`;
     if (consoleId) runtimeContext += `\nActive console ID: ${consoleId}`;
 
     runtimeContext += `\n\nQUESTION INTENT ANALYSIS (from pre-parser):\n` + JSON.stringify(questionContext, null, 2);
