@@ -698,7 +698,6 @@ JSON only:` }],
     let executedSql = "";
     let sqlResultsList: any[] = [];
     let stepsCount = 0;
-    const TIMEOUT_MS = 120_000;
 
     const messagesArray = [
       ...(history as any),
@@ -720,12 +719,7 @@ JSON only:` }],
         }
       });
 
-      const result = await Promise.race([
-        resultPromise,
-        new Promise<any>((_, reject) =>
-          setTimeout(() => reject(new Error("Agent timed out after 120s")), TIMEOUT_MS)
-        )
-      ]);
+      const result = await resultPromise;
 
       stepsCount = result.steps?.length ?? 1;
 
@@ -756,7 +750,7 @@ You ran ${sqlResultsList.length} queries returning a total of ${totalRows} rows.
 Here is the ACTUAL DATA you generated:
 ${allDataJson.slice(0, 12000)}${allDataJson.length > 12000 ? "\n...(truncated to fit)" : ""}`;
 
-    const reportResultPromise = generateText({
+    const reportResult = await generateText({
       model: reasonerModel,
       system: REPORT_SYSTEM_PROMPT,
       messages: [
@@ -765,13 +759,6 @@ ${allDataJson.slice(0, 12000)}${allDataJson.length > 12000 ? "\n...(truncated to
       ],
       temperature: 0,
     });
-
-    const reportResult = await Promise.race([
-      reportResultPromise,
-      new Promise<any>((_, reject) =>
-        setTimeout(() => reject(new Error("Agent timed out after 120s")), TIMEOUT_MS)
-      )
-    ]);
 
     const finalReport = reportResult.text?.trim() || `## Results\n\n${allDataJson}`;
     const totalSteps = stepsCount + 1;
