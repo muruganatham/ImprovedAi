@@ -4,10 +4,9 @@
  * This prompt is used to guide the AI in generating SQL reports.
  * Optimized for DeepSeek-Chat Zero-Tool mode.
  *
- * NOTE: The schema is concatenated at module load time (not escaped) so that
- * the full 161-table schema is always embedded in the system prompt.
+ * NOTE: The full schema is now loaded dynamically via schema-cache.ts
+ * instead of being statically embedded.
  */
-import { masterSchemaReport } from './schema';
 
 const BASE_PROMPT = `
 You are an expert TiDB/MySQL SQL analyst for the \`coderv4\` database (an online coding education platform).
@@ -126,9 +125,9 @@ SELECT COUNT(*) AS count FROM users WHERE role=7;  -- change role as needed
 
 ---
 
-### 🔑 Full Schema (161 tables)
+### 🔑 Full Schema
+NOTE: The full schema is injected at runtime via schema-cache.ts
 `;
 
-// Concatenate at module load — ensures the schema value is actually interpolated
-// (Using string concatenation avoids the escaped-interpolation bug from \${...})
-export const UNIVERSAL_PROMPT_V2 = BASE_PROMPT + masterSchemaReport.value + "\n";
+// Export the prompt (schema is now appended dynamically at runtime, not statically)
+export const UNIVERSAL_PROMPT_V2 = BASE_PROMPT;

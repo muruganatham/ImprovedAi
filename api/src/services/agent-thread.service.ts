@@ -3,7 +3,7 @@ import mongoose from "mongoose";
 import { v4 as uuidv4 } from "uuid";
 import type { UIMessage } from "ai";
 import { Chat, SavedConsole } from "../database/workspace-schema";
-import type { AgentKind } from "../agent-lib";
+import type { AgentKind } from "../agent-lib/types";
 import { loggers } from "../logging";
 
 const logger = loggers.agent();
@@ -464,30 +464,30 @@ export const persistChatError = async (
       toolCalls:
         partialToolCalls && partialToolCalls.length > 0
           ? [
-              ...partialToolCalls,
-              {
-                toolName: "_error",
-                timestamp: now,
-                status: "completed" as const,
-                result: {
-                  error: error.message,
-                  code: error.code,
-                  type: error.type,
-                },
+            ...partialToolCalls,
+            {
+              toolName: "_error",
+              timestamp: now,
+              status: "completed" as const,
+              result: {
+                error: error.message,
+                code: error.code,
+                type: error.type,
               },
-            ]
+            },
+          ]
           : [
-              {
-                toolName: "_error",
-                timestamp: now,
-                status: "completed" as const,
-                result: {
-                  error: error.message,
-                  code: error.code,
-                  type: error.type,
-                },
+            {
+              toolName: "_error",
+              timestamp: now,
+              status: "completed" as const,
+              result: {
+                error: error.message,
+                code: error.code,
+                type: error.type,
               },
-            ],
+            },
+          ],
     });
 
     await Chat.findByIdAndUpdate(
