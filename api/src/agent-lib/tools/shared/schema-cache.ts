@@ -37,10 +37,10 @@ async function loadFullSchema(): Promise<string> {
 
         const tableNames: string[] = tablesResult.data.map((r: any) => r.table_name as string);
 
-        // Get ALL columns for the database in one efficient query (no IN clause needed)
+        // Get ALL columns for the database in one efficient query (including comments)
         const colsResult = await databaseConnectionService.executeQuery(
             DB_ID,
-            `SELECT table_name, column_name, data_type, column_key
+            `SELECT table_name, column_name, data_type, column_key, column_comment
        FROM information_schema.columns
        WHERE table_schema = '${DB_NAME}'
        ORDER BY table_name, ordinal_position;`,
@@ -49,12 +49,14 @@ async function loadFullSchema(): Promise<string> {
 
         if (!colsResult.success || !colsResult.data) return "";
 
-        // Group columns by table
+        // Group columns by table, including column comments for context
         const tableMap = new Map<string, string[]>();
         for (const col of colsResult.data as any[]) {
             if (!tableMap.has(col.table_name)) tableMap.set(col.table_name, []);
             const key = col.column_key === "PRI" ? `**${col.column_name}**` : col.column_name;
-            tableMap.get(col.table_name)!.push(`${key}:${col.data_type}`);
+            const comment = col.column_comment?.trim();
+            const colEntry = comment ? `${key}:${col.data_type}(${comment})` : `${key}:${col.data_type}`;
+            tableMap.get(col.table_name)!.push(colEntry);
         }
 
         // Build compact schema block
