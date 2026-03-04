@@ -126,7 +126,8 @@ const SCHEMA_TABLES = [
   'users', 'user_academics', 'colleges', 'departments',
   'batches', 'sections', 'courses', 'course_academic_maps',
   'course_wise_segregations', 'user_course_enrollments',
-  'course_staff_trainer_allocations'
+  'course_staff_trainer_allocations', 'institutions',
+  'practice_modules', 'topics', 'sections'
 ];
 
 async function loadSchemaCache() {
@@ -140,6 +141,7 @@ async function loadSchemaCache() {
       }
     }
     schema += `\nDATA PATTERNS:\n`;
+    schema += `- Dynamic tables: {college}_{year}_{sem}_coding_result, {college}_{year}_{sem}_mcq_result, {college}_{year}_{sem}_test_data — use list_tables tool to find specific ones\n`;
     schema += `- course_wise_segregations.type: 1=coding, 2=MCQ, 3=quiz\n`;
     schema += `- users.role: 1=SuperAdmin, 2=Admin, 3=CollegeAdmin, 4=Staff, 5=Trainer, 6=ContentCreator, 7=Student\n`;
     schema += `- users.gender: 1=Male, 2=Female\n`;
