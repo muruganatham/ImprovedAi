@@ -1,11 +1,11 @@
-/**
- * Agent Routes â€” Pre-Fetch + Role Access + Anti-Hallucination + Cache + Fallback
+﻿/**
+ * Agent Routes — Pre-Fetch + Role Access + Anti-Hallucination + Cache + Fallback
  *
  * Architecture:
- *   Known questions â†’ buildUserContext() â†’ buildDataReport() â†’ LLM insights (fast, cached)
- *   Unknown questions â†’ handleWithTools() â†’ LLM discovers with tools (secure fallback)
- *   Greeting â†’ personalized by role + college (instant)
- *   General â†’ deepseek-reasoner knowledge answer (1 call)
+ *   Known questions → buildUserContext() → buildDataReport() → LLM insights (fast, cached)
+ *   Unknown questions → handleWithTools() → LLM discovers with tools (secure fallback)
+ *   Greeting → personalized by role + college (instant)
+ *   General → deepseek-reasoner knowledge answer (1 call)
  *
  * Numbers ALWAYS come from code templates. LLM NEVER touches numbers.
  */
@@ -27,7 +27,7 @@ export const agentRoutes = new Hono();
 const dbName = process.env.DB_NAME || "coderv4";
 const dbMock = { _id: "000000000000000000000002", type: "mysql" } as any;
 
-// â”€â”€ DeepSeek model factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── DeepSeek model factory ────────────────────────────────────────────────────
 function makeDeepSeekModel(modelName: "deepseek-chat" | "deepseek-reasoner" = "deepseek-chat") {
   const patchedFetch = async (url: string, options: any) => {
     if (options?.body) {
@@ -55,11 +55,11 @@ function makeDeepSeekModel(modelName: "deepseek-chat" | "deepseek-reasoner" = "d
   return provider.chat(modelName);
 }
 
-// â”€â”€ Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Routes ────────────────────────────────────────────────────────────────────
 agentRoutes.get("/models", (c) => c.json({ models: getAvailableModels() }));
 agentRoutes.get("/agents", (c) => c.json({ agents: getAllAgentMeta() }));
 
-// â”€â”€ Deduplication middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Deduplication middleware ───────────────────────────────────────────────────
 const recentRequests = new Map<string, number>();
 setInterval(() => {
   const cutoff = Date.now() - 10_000;
@@ -83,7 +83,7 @@ agentRoutes.use("/chat", async (c, next) => {
 });
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// CACHE â€” 5 min for user data, 30 min for table lists
+// CACHE — 5 min for user data, 30 min for table lists
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 const dataCache = new Map<string, { result: any; expiry: number }>();
@@ -108,7 +108,7 @@ setInterval(() => {
 }, 10 * 60_000);
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// DATA LAYER â€” Deterministic data fetching. LLM never touches the DB.
+// DATA LAYER — Deterministic data fetching. LLM never touches the DB.
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 async function runQuery(sql: string): Promise<{ rows: any[]; sql: string; error?: string }> {
@@ -160,7 +160,7 @@ loadSchemaCache();
 setInterval(loadSchemaCache, 30 * 60_000);
 
 
-// â”€â”€ User profile (always fetched for context + college_id) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── User profile (always fetched for context + college_id) ────────────────────
 async function getUserProfile(userId: number) {
   const res = await runQuery(`
     SELECT u.id, u.name, u.email, u.role, u.roll_no,
@@ -176,7 +176,7 @@ async function getUserProfile(userId: number) {
   return res.rows?.[0] || null;
 }
 
-// â”€â”€ Cached table list helpers (30 min TTL â€” tables rarely change) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Cached table list helpers (30 min TTL — tables rarely change) ─────────────
 async function getAllCodingTables(): Promise<string[]> {
   const cached = getCached('all_coding_tables');
   if (cached) return cached;
@@ -204,7 +204,7 @@ async function getAllTestTables(): Promise<string[]> {
   return tables;
 }
 
-// â”€â”€ Coding summary (cached 5 min) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Coding summary (cached 5 min) ─────────────────────────────────────────────
 async function getCodingSummary(userId: number) {
   const cached = getCached(`coding_${userId}`);
   if (cached) return cached;
@@ -240,7 +240,7 @@ async function getCodingSummary(userId: number) {
   return result;
 }
 
-// â”€â”€ MCQ summary (cached 5 min) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── MCQ summary (cached 5 min) ────────────────────────────────────────────────
 async function getMcqSummary(userId: number) {
   const cached = getCached(`mcq_${userId}`);
   if (cached) return cached;
@@ -274,7 +274,7 @@ async function getMcqSummary(userId: number) {
   return result;
 }
 
-// â”€â”€ Test score summary (cached 5 min) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Test score summary (cached 5 min) ─────────────────────────────────────────
 async function getTestScoreSummary(userId: number) {
   const cached = getCached(`test_${userId}`);
   if (cached) return cached;
@@ -299,7 +299,7 @@ async function getTestScoreSummary(userId: number) {
   return result;
 }
 
-// â”€â”€ College comparison (with optional single-college filter) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── College comparison (with optional single-college filter) ──────────────────
 async function getCollegeComparison(collegeId?: number) {
   let whereClause = "WHERE c.status = 1";
   if (collegeId) whereClause += ` AND c.id = ${Number(collegeId)}`;
@@ -318,7 +318,7 @@ async function getCollegeComparison(collegeId?: number) {
   return { colleges: res.rows, sql };
 }
 
-// â”€â”€ Student count (with optional college filter) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Student count (with optional college filter) ──────────────────────────────
 async function getStudentCount(collegeFilter?: string, collegeId?: number) {
   let sql: string;
   if (collegeId) {
@@ -344,7 +344,7 @@ async function getStudentCount(collegeFilter?: string, collegeId?: number) {
   return { count: res.rows[0]?.total ?? 0, sql };
 }
 
-// â”€â”€ Courses for a user â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Courses for a user ────────────────────────────────────────────────────────
 async function getUserCourses(userId: number) {
   const sql = `
     SELECT c.course_name, c.course_short_name, cws.score, cws.progress, cws.type,
@@ -358,7 +358,7 @@ async function getUserCourses(userId: number) {
   return { courses: res.rows, sql };
 }
 
-// â”€â”€ Search users (with optional college scoping) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Search users (with optional college scoping) ──────────────────────────────
 async function searchUser(searchTerm: string, collegeId?: number) {
   // Fix #9: Escape backslashes AND single quotes to prevent SQL injection
   const safe = searchTerm.replace(/\\/g, '\\\\').replace(/'/g, "''").replace(/[%_]/g, c => '\\' + c);
@@ -385,7 +385,7 @@ async function searchUser(searchTerm: string, collegeId?: number) {
   return { users: res.rows, sql };
 }
 
-// â”€â”€ Top students (with optional college scoping) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Top students (with optional college scoping) ──────────────────────────────
 async function getTopStudents(collegeFilter?: string, limit: number = 10, collegeId?: number) {
   const tablesRes = await runQuery("SHOW TABLES LIKE '%\\_test\\_data'");
   const tables = (tablesRes.rows || []).map((r: any) => Object.values(r)[0] as string);
@@ -435,7 +435,7 @@ async function getTopStudents(collegeFilter?: string, limit: number = 10, colleg
 
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// SCOPE PROMPT BUILDER â€” Guide the LLM, don't replace it
+// SCOPE PROMPT BUILDER — Guide the LLM, don't replace it
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 /**
@@ -609,7 +609,7 @@ function preRouteQuestion(q: string): "general" | "db" | "greeting" {
 
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// LLM LAYER â€” Only for insights and general knowledge. NEVER for numbers.
+// LLM LAYER — Only for insights and general knowledge. NEVER for numbers.
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 const GENERAL_KNOWLEDGE_PROMPT = `You are Devora AI Assistant  and online coding education platform. Always here to help.
@@ -620,17 +620,17 @@ Answer clearly and thoroughly in Markdown format.
 - For programming topics, include a short code example in a fenced code block
 - Add practical context for how it applies to software development
 - End with 1-2 sentences on real-world relevance
-Keep it educational and engaging. This is NOT a database question â€” do not try to query anything.`;
+Keep it educational and engaging. This is NOT a database question — do not try to query anything.`;
 
 
 
 function getGreeting(userName: string, roleName: string, collegeName: string | null): string {
-  // â”€â”€ Student (role=7) â”€â”€
+  // ── Student (role=7) ──
   if (roleName === "Student") {
-    return `## ðŸ¤– Devora AI Assistant
+    return `## 🤖 Devora AI Assistant
 **Hello ${userName}!** Welcome back.
 
-### ðŸ’¡ Try asking me:
+### 💡 Try asking me:
 - *"Show my coding performance"*
 - *"How many coding questions have I solved?"*
 - *"What is my MCQ accuracy?"*
@@ -641,12 +641,12 @@ ${collegeName ? `\nYou're studying at **${collegeName}**. I can see all your per
 What would you like to know?`;
   }
 
-  // â”€â”€ Staff/Trainer (role=4,5) â”€â”€
+  // ── Staff/Trainer (role=4,5) ──
   if (roleName === "Staff" || roleName === "Trainer") {
-    return `## ðŸ¤– Devora AI Assistant
+    return `## 🤖 Devora AI Assistant
 **Hello ${userName}!** Welcome back.
 
-### ðŸ’¡ Try asking me:
+### 💡 Try asking me:
 ${collegeName
         ? `- *"Top 10 students in ${collegeName}"*\n- *"How many students in ${collegeName}?"*\n- *"${collegeName} coding performance overview"*`
         : `- *"Top 10 students"*\n- *"Student performance overview"*`}
@@ -657,12 +657,12 @@ ${collegeName
 What insights would you like?`;
   }
 
-  // â”€â”€ CollegeAdmin (role=3) â”€â”€
+  // ── CollegeAdmin (role=3) ──
   if (roleName === "CollegeAdmin") {
-    return `## ðŸ¤– Devora AI Assistant
+    return `## 🤖 Devora AI Assistant
 **Hello ${userName}!** Welcome back.
 
-### ðŸ’¡ Try asking me:
+### 💡 Try asking me:
 ${collegeName
         ? `- *"${collegeName} performance overview"*\n- *"Top students in ${collegeName}"*\n- *"Compare departments in ${collegeName}"*`
         : `- *"College performance overview"*\n- *"Top students"*`}
@@ -673,25 +673,20 @@ ${collegeName
 What would you like to explore?`;
   }
 
-  // â”€â”€ Admin/SuperAdmin (role=1,2) â”€â”€
-  return `## ðŸ¤– Devora AI Assistant
+  // ── Admin/SuperAdmin (role=1,2) ──
+  return `## 🤖 Devora AI Assistant
 **Hello ${userName}!** Welcome back.
 
-### ðŸ“Š Smart Insights I Can Provide:
+### 📊 Smart Insights I Can Provide:
 - ðŸ† *"Compare all colleges"*
 - ðŸ” *"Top 10 students platform-wide"*
-- ðŸ“ˆ *"How many students across all colleges?"*
-- ðŸŽ“ *"Which course has the highest enrollment?"*
+- 📈 *"How many students across all colleges?"*
+- 🎓 *"Which course has the highest enrollment?"*
 - ðŸ« *"SKCET vs SREC vs MCET comparison"*
-- ðŸ‘¤ *"Find student karthick"*
+- 👤 *"Find student karthick"*
 
 What insights would you like to explore?`;
 }
-
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// LLM WITH TOOLS â€” The brain. Scope prompt guides, LLM executes.
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 async function handleWithTools(
   question: string,
@@ -857,14 +852,14 @@ async function handleDbQuestion(
 
   logger.info(`Agent chat (${options.version})`, { userId, role: roleNum, route, question: question.slice(0, 80) });
 
-  // â”€â”€ GREETING (instant, personalized) â”€â”€
+  // ── GREETING (instant, personalized) ──
   if (route === "greeting") {
     const profile = await getUserProfile(Number(userId));
     const roleName = getRoleName(roleNum);
     return { report: getGreeting(profile?.name || "there", roleName, profile?.college_name || null), sql: null, steps: 0 };
   }
 
-  // â”€â”€ GENERAL KNOWLEDGE (no DB) â”€â”€
+  // ── GENERAL KNOWLEDGE (no DB) ──
   if (route === "general") {
     try {
       const result = await generateText({
@@ -881,7 +876,7 @@ async function handleDbQuestion(
     }
   }
 
-  // â”€â”€ DB QUESTION: Classify â†’ Scope â†’ LLM â”€â”€
+  // ── DB QUESTION: Classify → Scope → LLM ──
   try {
     const t0 = Date.now();
     const numUserId = Number(userId);
@@ -891,13 +886,13 @@ async function handleDbQuestion(
     const scope = classification.scope;
     logger.info(`Question classified (${options.version})`, { userId, role: roleNum, scope, reason: classification.reason });
 
-    // STEP 2: IDENTITY fast-path (reason === 'identity' within personal scope) â€” instant profile, no LLM needed
+    // STEP 2: IDENTITY fast-path (reason === 'identity' within personal scope) — instant profile, no LLM needed
     if (classification.reason === "identity") {
       const profile = await getUserProfile(numUserId);
       if (!profile) return { report: "Could not find your profile.", sql: null, steps: 1 };
       const roleName = getRoleName(profile.role);
       const report = `### User Profile\n\n| Field | Value |\n|-------|-------|\n| Name | ${profile.name} |\n| Email | ${profile.email} |\n| Role | ${roleName} |\n| Roll No | ${profile.roll_no || 'N/A'} |\n| College | ${profile.college_name || 'N/A'} |\n| Department | ${profile.department_name || 'N/A'} |\n| Batch | ${profile.batch_name || 'N/A'} |\n`;
-      logger.info(`Agent chat complete â€” identity fast-path (${options.version})`, { userId, totalTimeMs: Date.now() - t0 });
+      logger.info(`Agent chat complete — identity fast-path (${options.version})`, { userId, totalTimeMs: Date.now() - t0 });
       return { report, sql: null, steps: 1 };
     }
 
@@ -908,11 +903,11 @@ async function handleDbQuestion(
 
     // STEP 4: Check if blocked (student asking restricted questions)
     if (scopeResult.blocked) {
-      logger.info(`Agent chat complete â€” blocked (${options.version})`, { userId, role: roleNum, scope });
+      logger.info(`Agent chat complete — blocked (${options.version})`, { userId, role: roleNum, scope });
       return { report: scopeResult.blockReason || "Access denied.", sql: null, steps: 1 };
     }
 
-    // STEP 5: LLM with tools â€” the brain does the work
+    // STEP 5: LLM with tools — the brain does the work
     logger.info(`LLM with tools (${options.version})`, { userId, role: roleNum, scope });
     const result = await handleWithTools(question, numUserId, roleNum, history, options, scopeResult.prompt);
     const totalTime = Date.now() - t0;
@@ -927,7 +922,7 @@ async function handleDbQuestion(
 }
 
 
-// â”€â”€ POST /chat â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── POST /chat ─────────────────────────────────────────────────────────────────
 agentRoutes.post("/chat", async (c) => {
   let body: Record<string, any> = {};
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
@@ -948,7 +943,7 @@ agentRoutes.post("/chat", async (c) => {
   }
 });
 
-// â”€â”€ POST /chat-v2 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── POST /chat-v2 ──────────────────────────────────────────────────────────────
 agentRoutes.post("/chat-v2", async (c) => {
   let body: Record<string, any> = {};
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON body" }, 400); }
