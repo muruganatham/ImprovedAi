@@ -127,7 +127,8 @@ const SCHEMA_TABLES = [
   'batches', 'sections', 'courses', 'course_academic_maps',
   'course_wise_segregations', 'user_course_enrollments',
   'course_staff_trainer_allocations', 'institutions',
-  'practice_modules', 'topics', 'sections'
+  'practice_modules', 'topics', 'titles',
+  'verify_certificates', 'languages'
 ];
 
 async function loadSchemaCache() {
@@ -182,7 +183,74 @@ async function loadSchemaCache() {
     schema += `- "enrolled courses" / "my scores" → course_wise_segregations WHERE user_id = X\n`;
     schema += `- "my trainer" → course_wise_segregations → course_academic_maps → course_staff_trainer_allocations\n`;
     schema += `- Student progress/scores (aggregated) → course_wise_segregations (best table)\n`;
-    schema += `- Per-question details → dynamic coding_result/mcq_result tables\n`;
+    schema += `- Per-question details → dynamic coding_result/mcq_result tables\n\n`;
+
+    schema += `DATA RELATIONSHIPS (how to trace Course → Topic → Question → Result):\n`;
+    schema += `1. Student's courses: course_wise_segregations WHERE user_id = X (aggregated scores)\n`;
+    schema += `2. Course topics: course_academic_maps WHERE course_id = X AND college_id = Y\n`;
+    schema += `   → topic_name = topic label. db = semester prefix for dynamic tables.\n`;
+    schema += `3. Per-question coding: {db}_coding_result WHERE user_id = X AND course_allocation_id = cam.id\n`;
+    schema += `   → errors (JSON array): each element has {error: string, details: string}\n`;
+    schema += `   → action_counts (JSON): {att: attempts, run: runs, ver: verifications, deb: debug}\n`;
+    schema += `   → main_solution (text): the student's actual submitted code\n`;
+    schema += `4. Per-question MCQ: {db}_mcq_result WHERE user_id = X AND course_allocation_id = cam.id\n`;
+    schema += `5. Test session: {db}_test_data WHERE user_id = X\n`;
+    schema += `   → mark/total_mark are JSON: {co: coding, mcq: mcq, pro: project}\n`;
+    schema += `   → question_ids (JSON array): list of question IDs in this test\n\n`;
+
+    schema += `COMMON STUDENT DEEP-DIVE QUERIES:\n`;
+    schema += `- "my course details" → course_wise_segregations + courses table\n`;
+    schema += `- "topic-wise breakdown" → JOIN coding_result with course_academic_maps on course_allocation_id = cam.id\n`;
+    schema += `- "what errors did I make" → coding_result.errors JSON (array of {error, details})\n`;
+    schema += `- "how to fix my errors" → Read errors JSON, explain the compilation/runtime error\n`;
+    schema += `- "my coding attempts" → action_counts JSON: att=attempts, run=code runs, ver=test verifications\n`;
+    schema += `- "show my code" → main_solution column (text, student's submitted code)\n\n`;
+
+    schema += `IMPORTANT — Finding dynamic tables for a student:\n`;
+    schema += `  The student's dynamic table prefixes are pre-fetched and provided in the ACCESS CONTROL section.\n`;
+    schema += `  Use those prefixes directly — do NOT query college_short_name or cam.db yourself!\n`;
+    schema += `  If no prefixes are provided, query: SELECT DISTINCT cam.db FROM course_wise_segregations cws\n`;
+    schema += `    JOIN course_academic_maps cam ON cws.course_allocation_id = cam.allocation_id\n`;
+    schema += `    WHERE cws.user_id = {user_id} AND cam.db IS NOT NULL\n`;
+    schema += `  ⚠️ cam.db may differ from college_short_name! (e.g., dotlab ≠ demolab, skacas ≠ skasc)\n\n`;
+
+    schema += `PERFORMANCE OVERVIEW (use FIRST for "how am I doing?" questions):\n`;
+    schema += `  course_wise_segregations: Pre-computed summary per user per course.\n`;
+    schema += `  Columns: progress (%), score, rank, performance_rank, time_spend (sec)\n`;
+    schema += `  JSON columns:\n`;
+    schema += `    coding_question: {total_question, attend_question, solved_question, par_question, obtain_score, total_score, code_quality}\n`;
+    schema += `    mcq_question: {total_question, attend_question, solved_question, par_question, obtain_score, total_score}\n`;
+    schema += `  JOIN: cws.course_id → courses.id for course names\n`;
+    schema += `  ⚠️ cws.course_allocation_id → cam.allocation_id (NOT cam.id!)\n`;
+    schema += `  Use CWS for overview. For question-level detail, query dynamic result tables.\n\n`;
+
+    schema += `DYNAMIC TABLE ROUTING:\n`;
+    schema += `  course_academic_maps has TWO IDs — don't confuse them:\n`;
+    schema += `    cam.id (PK) → referenced as course_allocation_id in coding_result/mcq_result\n`;
+    schema += `    cam.allocation_id → referenced as course_allocation_id in course_wise_segregations\n`;
+    schema += `    cam.allocation_id → also referenced as allocate_id in some result tables\n`;
+    schema += `  cam.db = exact dynamic table prefix (e.g., "srec_2025_2")\n`;
+    schema += `  cam.type: 0=Prepare, 1=Assessment, 2=Assignment\n\n`;
+
+    schema += `DAILY ACTIVITY: \`2025_submission_tracks\` and \`2026_submission_tracks\`\n`;
+    schema += `  (⚠️ backticks REQUIRED — table names start with numbers!)\n`;
+    schema += `  mode: 1=mcq/fillups, 2=coding | type: 1=prepare, 2=assessment\n`;
+    schema += `  period: month number\n`;
+    schema += `  attended_count_details: JSON {"YYYY-MM-DD": [question_ids]}\n`;
+    schema += `  solved_count_details: JSON {"YYYY-MM-DD": [question_ids]}\n\n`;
+
+    schema += `CERTIFICATES: verify_certificates table\n`;
+    schema += `  user_id, course_id, college_id, total_mark, mark_obtained, percentage, grade, p_id\n\n`;
+
+    schema += `HIERARCHY: courses → titles (chapters) → topics (lessons)\n`;
+    schema += `  course_topic_maps: course_id → title_id → topic_id + order\n`;
+    schema += `  languages table: id → language_name (for compile_id lookups in coding_result)\n\n`;
+
+    schema += `ROLE MAPPING: users.role integer values:\n`;
+    schema += `  1=Super Admin, 2=Admin, 3=College Admin, 4=Staff, 5=Trainer, 6=Content Creator, 7=Student\n\n`;
+
+    schema += `AI USAGE COLUMNS (users table):\n`;
+    schema += `  stats_chat_count (int), stats_words_generated (bigint), active_streak (int), last_active_date\n`;
     cachedSchemaPrompt = schema;
     logger.info(`[schema-cache] Cached ${SCHEMA_TABLES.length} table schemas`);
   } catch (err: any) {
@@ -287,8 +355,8 @@ async function getMcqSummary(userId: number) {
   const unionSql = tables.map((t: string) => `
     SELECT '${t}' AS source,
       COUNT(*) AS total_attended,
-      SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) AS correct,
-      SUM(CASE WHEN is_correct = 0 THEN 1 ELSE 0 END) AS wrong
+      SUM(CASE WHEN solve_status = 2 THEN 1 ELSE 0 END) AS correct,
+      SUM(CASE WHEN solve_status = 3 THEN 1 ELSE 0 END) AS wrong
     FROM \`${t}\` WHERE user_id = ${Number(userId)} AND status = 1
   `).join(" UNION ALL ");
 
@@ -483,13 +551,21 @@ function buildScopePrompt(
   collegeId: number | null,
   scope: string,
   userName?: string,
+  collegeShortName?: string,
+  collegeDynamicTables?: string[],
 ): { prompt: string; blocked: boolean; blockReason?: string } {
   const roleName = getRoleName(roleNum);
   const sqlScope = getSQLScope(roleNum, userId, collegeId);
   const name = userName || 'User';
 
   let prompt = `\n--- ACCESS CONTROL ---\n`;
-  prompt += `Current user: ${name} (${roleName}, user_id=${userId})\n\n`;
+  prompt += `Current user: ${name} (${roleName}, user_id=${userId})\n`;
+  if (collegeShortName) {
+    prompt += `College: ${collegeShortName} (college_id=${collegeId})\n`;
+    prompt += `Dynamic tables for this student: ${(collegeDynamicTables || []).join(', ') || `Use SHOW TABLES LIKE '${collegeShortName}_%'`}\n`;
+    prompt += `→ Use these tables directly — do NOT query college_short_name again!\n`;
+  }
+  prompt += `\n`;
 
   // Security rules apply to ALL roles
   prompt += `SECURITY RULES (apply to ALL roles):\n`;
@@ -507,6 +583,7 @@ function buildScopePrompt(
     prompt += `- For "my scores/progress": query course_wise_segregations WHERE user_id = ${userId}.\n`;
     prompt += `- For "my trainer": find via course_wise_segregations -> course_academic_maps -> course_staff_trainer_allocations.\n`;
     prompt += `- For "my courses/enrolled": query course_wise_segregations WHERE user_id = ${userId} AND status = 1.\n`;
+    prompt += `- For question titles: JOIN academic_qb_codings aqc ON coding_result.question_id = aqc.id → use aqc.title\n`;
     prompt += `\n--- END ACCESS CONTROL ---\n`;
     return { prompt, blocked: false };
   }
@@ -617,6 +694,16 @@ function preRouteQuestion(q: string): "general" | "db" | "greeting" {
     /^(what are (the )?benefits|advantages|disadvantages)/i,
   ];
   const platformTerms = /student|college|batch|enrolled|score|course|result|skcet|srec|allocated|my\s|department|mcet|kits|skct|niet|kclas|ciet/i;
+
+  // FIX #2: Check if the question references a person's name BEFORE routing to general.
+  // Without this, "tell me about muruganantham" matches "tell me about" and bypasses
+  // the classifier entirely, skipping all RBAC layers.
+  const personNameCheck = /\b(tell\s+(me\s+)?about|who\s+is|who's|explain\s+about|describe)\s+([a-z]{2,})\b/i;
+  const techTerms = /\b(java|python|c\+\+|c#|react|html|css|javascript|typescript|sql|mysql|mongodb|node|express|angular|vue|swift|kotlin|ruby|php|go|rust|dart|flutter|django|flask|spring|docker|kubernetes|git|linux|aws|azure|data\s*structures?|algorithms?|machine\s*learning|artificial\s*intelligence|web\s*dev|programming|coding|arrays?|linked\s*list|stacks?|queues?|trees?|graphs?|sorting|searching|oop|database|api|framework|loops?|functions?|variables?|courses?|modules?|topics?)\b/i;
+  if (personNameCheck.test(lower) && !techTerms.test(lower) && !platformTerms.test(lower)) {
+    // Likely asking about a person — route to DB so classifier can handle it
+    return "db";
+  }
 
   if (generalKnowledge.some(p => p.test(lower)) && !platformTerms.test(lower)) {
     return "general";
@@ -775,7 +862,18 @@ RULES:
 4. Format answer as markdown with tables where appropriate
 5. Be efficient — most queries need only 1-2 run_sql calls
 6. Present data clearly with counts, percentages, and comparisons
-7. For JOINs: users → user_academics (user_id) → colleges (college_id) → departments (department_id)`;
+7. For JOINs: users → user_academics (user_id) → colleges (college_id) → departments (department_id)
+8. ERROR ANALYSIS: When the student asks about errors or how to improve:
+   a. Query the errors column (JSON) from coding_result tables
+   b. Identify the error type (compilation, runtime, logic)
+   c. Explain what caused it in simple terms
+   d. Show the fix with a code example using ❌ (wrong) and ✅ (correct)
+   e. Look for error PATTERNS across questions (e.g., "you keep confusing char with String")
+9. DEEP DIVE: For detailed course/topic analysis:
+   a. First get courses from course_wise_segregations
+   b. Then get topics from course_academic_maps using the course_id + college_id
+   c. Then get per-question results from dynamic tables using course_allocation_id = cam.id
+   d. Present topic-wise breakdown with solved/partial/wrong counts`;
 
   const tools = {
     list_tables: tool({
@@ -821,9 +919,23 @@ RULES:
             return { error: "Only SELECT queries allowed" };
           }
 
-          // Security: student personal queries MUST include user_id
-          if (isStudentRole && scope === "personal" && !cleaned.includes(String(userId))) {
-            return { error: `Security: Personal queries must filter by user_id = ${userId}` };
+          // FIX #3: Use word-boundary regex instead of .includes() to prevent
+          // substring collisions (e.g. userId=23 matching "2372")
+          const userIdRegex = new RegExp(`\\b${userId}\\b`);
+
+          // FIX #1: For students, block queries touching sensitive tables
+          // (users, user_academics) without user_id — in ALL scopes, not just personal.
+          // Public catalog tables (courses, colleges, etc.) are fine without user_id.
+          if (isStudentRole) {
+            const queriesUserTable = /\bfrom\s+[`]?(users|user_academics)[`]?\b/i.test(cleaned)
+              || /\bjoin\s+[`]?(users|user_academics)[`]?\b/i.test(cleaned);
+            if (queriesUserTable && !userIdRegex.test(cleaned)) {
+              return { error: `Security: Student queries on user tables must filter by user_id = ${userId}` };
+            }
+            // Personal scope: ALL queries must include user_id
+            if (scope === "personal" && !userIdRegex.test(cleaned)) {
+              return { error: `Security: Personal queries must filter by user_id = ${userId}` };
+            }
           }
 
           const res = await databaseConnectionService.executeQuery(
@@ -849,7 +961,7 @@ RULES:
       { role: "user" as const, content: question.trim() }
     ],
     tools,
-    stopWhen: stepCountIs(12),
+    stopWhen: stepCountIs(8),
     temperature: 0,
   });
 
@@ -935,7 +1047,37 @@ async function handleDbQuestion(
     // STEP 3: Build scope prompt for LLM
     const profile = await getUserProfile(numUserId);
     const collegeId = profile?.college_id || null;
-    const scopeResult = buildScopePrompt(roleNum, numUserId, collegeId, scope, profile?.name);
+    const collegeShort = profile?.college_short_name || null;
+
+    // Pre-fetch dynamic table prefixes using cam.db (NOT college_short_name!)
+    // cam.db is the ACTUAL table prefix — handles mismatches like dotlab≠demolab, skacas≠skasc
+    let dynamicTables: string[] = [];
+    try {
+      const dbRes = await runQuery(`
+        SELECT DISTINCT cam.db
+        FROM course_wise_segregations cws
+        JOIN course_academic_maps cam ON cws.course_allocation_id = cam.allocation_id
+        WHERE cws.user_id = ${numUserId} AND cam.db IS NOT NULL AND cws.status = 1
+      `);
+      const dbPrefixes = (dbRes.rows || []).map((r: any) => r.db as string).filter(Boolean);
+
+      if (dbPrefixes.length > 0) {
+        // Fetch actual table names for each prefix
+        for (const prefix of dbPrefixes) {
+          const tablesRes = await runQuery(`SHOW TABLES LIKE '${prefix}_%'`);
+          const tables = (tablesRes.rows || []).map((r: any) => Object.values(r)[0] as string);
+          dynamicTables.push(...tables);
+        }
+      } else if (collegeShort) {
+        // Fallback: use college_short_name if cam.db lookup returns nothing
+        const tablesRes = await runQuery(`SHOW TABLES LIKE '${collegeShort}_%'`);
+        dynamicTables = (tablesRes.rows || []).map((r: any) => Object.values(r)[0] as string);
+      }
+    } catch (err: any) {
+      logger.error(`[dynamic-tables] Failed to fetch: ${err.message}`);
+    }
+
+    const scopeResult = buildScopePrompt(roleNum, numUserId, collegeId, scope, profile?.name, collegeShort, dynamicTables);
 
     // STEP 4: Check if blocked (student asking restricted questions)
     if (scopeResult.blocked) {
@@ -968,6 +1110,10 @@ agentRoutes.post("/chat", async (c) => {
     consoleId?: string; history?: { role: 'user' | 'assistant', content: string }[];
   };
 
+  // FIX #4: WARNING — user_id and user_role currently come from the POST body.
+  // In production, these MUST be validated server-side from a JWT/session token.
+  // A malicious user can send { user_role: 1 } to get SuperAdmin access.
+  // TODO: Replace with server-side auth extraction before production deployment.
   if (!question?.trim()) return c.json({ error: "'question' is required" }, 400);
   const userId = user_id ? String(user_id) : "anonymous";
 
