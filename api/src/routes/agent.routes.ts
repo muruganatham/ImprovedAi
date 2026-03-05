@@ -173,7 +173,7 @@ function buildRoleTailoredSchema(roleNum: number): string {
     schema += `- users.role: 1=SuperAdmin, 2=Admin, 3=CollegeAdmin, 4=Staff, 5=Trainer, 6=ContentCreator, 7=Student\n`;
     schema += `- users.gender: 1=Male, 2=Female, 3=Other (NULL/0=not set)\n`;
   }
-  schema += `- course_wise_segregations.type: 1=Coding, 2=MCQ\n`;
+  schema += `- course_wise_segregations.type: 1=Prepare, 2=Assessment (each row has BOTH coding_question and mcq_question JSON)\n`;
   schema += `- courses.category: 1=Foundation, 2=Advanced, 3=Specialized\n`;
   schema += `- status column (ALL tables): 1=active. Always add WHERE status=1.\n`;
 
@@ -266,7 +266,7 @@ function buildRoleTailoredSchema(roleNum: number): string {
   schema += `    cam.allocation_id → referenced as course_allocation_id in course_wise_segregations\n`;
   schema += `    cam.allocation_id → also referenced as allocate_id in some result tables\n`;
   schema += `  cam.db = exact dynamic table prefix (e.g., "srec_2025_2")\n`;
-  schema += `  cam.type: 0=Prepare, 1=Assessment, 2=Assignment\n\n`;
+  schema += `  cam.type: 0=Prepare, 1=Assessment, 2=Assignment, 3=Practice\n\n`;
 
   schema += `DAILY ACTIVITY: \`2025_submission_tracks\` and \`2026_submission_tracks\`\n`;
   schema += `  (⚠️ backticks REQUIRED — table names start with numbers!)\n`;
@@ -306,270 +306,13 @@ async function getUserProfile(userId: number) {
       c.id AS college_id, c.college_name, c.college_short_name,
       d.department_name, b.batch_name
     FROM users u
-    LEFT JOIN user_academics ua ON ua.user_id = u.id AND ua.college_id IS NOT NULL
+    LEFT JOIN user_academics ua ON ua.user_id = u.id AND ua.status = 1
     LEFT JOIN colleges c ON c.id = ua.college_id
     LEFT JOIN departments d ON d.id = ua.department_id
     LEFT JOIN batches b ON b.id = ua.batch_id
     WHERE u.id = ${isNaN(Number(userId)) ? 0 : Number(userId)} LIMIT 1
   `);
   return res.rows?.[0] || null;
-}
-
-// ── Cached table list helpers (30 min TTL — tables rarely change) ─────────────
-async function getAllCodingTables(): Promise<string[]> {
-  const cached = getCached('all_coding_tables');
-  if (cached) return cached;
-  const res = await runQuery("SHOW TABLES LIKE '%\\_coding\\_result'");
-  const tables = (res.rows || []).map((r: any) => Object.values(r)[0] as string);
-  setCache('all_coding_tables', tables, 30 * 60_000);
-  return tables;
-}
-
-async function getAllMcqTables(): Promise<string[]> {
-  const cached = getCached('all_mcq_tables');
-  if (cached) return cached;
-  const res = await runQuery("SHOW TABLES LIKE '%\\_mcq\\_result'");
-  const tables = (res.rows || []).map((r: any) => Object.values(r)[0] as string);
-  setCache('all_mcq_tables', tables, 30 * 60_000);
-  return tables;
-}
-
-async function getAllTestTables(): Promise<string[]> {
-  const cached = getCached('all_test_tables');
-  if (cached) return cached;
-  const res = await runQuery("SHOW TABLES LIKE '%\\_test\\_data'");
-  const tables = (res.rows || []).map((r: any) => Object.values(r)[0] as string);
-  setCache('all_test_tables', tables, 30 * 60_000);
-  return tables;
-}
-
-// ── Coding summary (cached 5 min) ─────────────────────────────────────────────
-async function getCodingSummary(userId: number) {
-  const cached = getCached(`coding_${userId}`);
-  if (cached) return cached;
-
-  const tables = await getAllCodingTables();
-
-  if (tables.length === 0) return { total_attended: 0, fully_solved: 0, partially_solved: 0, attempted_not_solved: 0, solve_rate: "0.00%", sources: [], sql: "" };
-
-  const unionSql = tables.map((t: string) => `
-    SELECT '${t}' AS source,
-      COUNT(*) AS total_attended,
-      SUM(CASE WHEN solve_status = 2 THEN 1 ELSE 0 END) AS fully_solved,
-      SUM(CASE WHEN solve_status = 1 THEN 1 ELSE 0 END) AS partially_solved,
-      SUM(CASE WHEN solve_status = 3 THEN 1 ELSE 0 END) AS attempted_not_solved
-    FROM \`${t}\` WHERE user_id = ${Number(userId)} AND status = 1
-  `).join(" UNION ALL ");
-
-  const res = await runQuery(unionSql);
-  const rows = (res.rows || []).filter((r: any) => Number(r.total_attended) > 0);
-
-  const totals = {
-    total_attended: rows.reduce((s: number, r: any) => s + Number(r.total_attended), 0),
-    fully_solved: rows.reduce((s: number, r: any) => s + Number(r.fully_solved), 0),
-    partially_solved: rows.reduce((s: number, r: any) => s + Number(r.partially_solved), 0),
-    attempted_not_solved: rows.reduce((s: number, r: any) => s + Number(r.attempted_not_solved), 0),
-  };
-  const solveRate = totals.total_attended > 0
-    ? ((totals.fully_solved / totals.total_attended) * 100).toFixed(2) + "%"
-    : "0.00%";
-
-  const result = { ...totals, solve_rate: solveRate, sources: rows, sql: unionSql };
-  setCache(`coding_${userId}`, result);
-  return result;
-}
-
-// ── MCQ summary (cached 5 min) ────────────────────────────────────────────────
-async function getMcqSummary(userId: number) {
-  const cached = getCached(`mcq_${userId}`);
-  if (cached) return cached;
-
-  const tables = await getAllMcqTables();
-
-  if (tables.length === 0) return { total_attended: 0, correct: 0, wrong: 0, accuracy: "0.00%", sources: [], sql: "" };
-
-  const unionSql = tables.map((t: string) => `
-    SELECT '${t}' AS source,
-      COUNT(*) AS total_attended,
-      SUM(CASE WHEN solve_status = 2 THEN 1 ELSE 0 END) AS correct,
-      SUM(CASE WHEN solve_status = 3 THEN 1 ELSE 0 END) AS wrong
-    FROM \`${t}\` WHERE user_id = ${Number(userId)} AND status = 1
-  `).join(" UNION ALL ");
-
-  const res = await runQuery(unionSql);
-  const rows = (res.rows || []).filter((r: any) => Number(r.total_attended) > 0);
-
-  const totals = {
-    total_attended: rows.reduce((s: number, r: any) => s + Number(r.total_attended), 0),
-    correct: rows.reduce((s: number, r: any) => s + Number(r.correct), 0),
-    wrong: rows.reduce((s: number, r: any) => s + Number(r.wrong), 0),
-  };
-  const accuracy = totals.total_attended > 0
-    ? ((totals.correct / totals.total_attended) * 100).toFixed(2) + "%"
-    : "0.00%";
-
-  const result = { ...totals, accuracy, sources: rows, sql: unionSql };
-  setCache(`mcq_${userId}`, result);
-  return result;
-}
-
-// ── Test score summary (cached 5 min) ─────────────────────────────────────────
-async function getTestScoreSummary(userId: number) {
-  const cached = getCached(`test_${userId}`);
-  if (cached) return cached;
-
-  const tables = await getAllTestTables();
-
-  if (tables.length === 0) return { sources: [], sql: "" };
-
-  const unionSql = tables.map((t: string) => `
-    SELECT '${t}' AS source,
-      COUNT(*) AS modules_attempted,
-      ROUND(SUM(JSON_EXTRACT(mark, '$.co')) * 100.0 / NULLIF(SUM(JSON_EXTRACT(total_mark, '$.co')), 0), 2) AS coding_pct,
-      ROUND(SUM(JSON_EXTRACT(mark, '$.mcq')) * 100.0 / NULLIF(SUM(JSON_EXTRACT(total_mark, '$.mcq')), 0), 2) AS mcq_pct
-    FROM \`${t}\` WHERE user_id = ${Number(userId)} AND status = 1
-  `).join(" UNION ALL ");
-
-  const res = await runQuery(unionSql);
-  const rows = (res.rows || []).filter((r: any) => Number(r.modules_attempted) > 0);
-
-  const result = { sources: rows, sql: unionSql };
-  setCache(`test_${userId}`, result);
-  return result;
-}
-
-// ── College comparison (with optional single-college filter) ──────────────────
-async function getCollegeComparison(collegeId?: number) {
-  let whereClause = "WHERE c.status = 1";
-  if (collegeId) whereClause += ` AND c.id = ${Number(collegeId)}`;
-
-  const sql = `
-    SELECT c.id, c.college_name, c.college_short_name,
-      COUNT(DISTINCT ua.user_id) AS student_count
-    FROM colleges c
-    LEFT JOIN user_academics ua ON ua.college_id = c.id
-    LEFT JOIN users u ON u.id = ua.user_id AND u.role = 7 AND u.status = 1
-    ${whereClause}
-    GROUP BY c.id, c.college_name, c.college_short_name
-    ORDER BY student_count DESC
-  `;
-  const res = await runQuery(sql);
-  return { colleges: res.rows, sql };
-}
-
-// ── Student count (with optional college filter) ──────────────────────────────
-async function getStudentCount(collegeFilter?: string, collegeId?: number) {
-  let sql: string;
-  if (collegeId) {
-    sql = `
-      SELECT COUNT(DISTINCT u.id) AS total
-      FROM users u
-      JOIN user_academics ua ON ua.user_id = u.id
-      WHERE u.role = 7 AND u.status = 1 AND ua.college_id = ${Number(collegeId)}
-    `;
-  } else if (collegeFilter) {
-    sql = `
-      SELECT COUNT(DISTINCT u.id) AS total
-      FROM users u
-      JOIN user_academics ua ON ua.user_id = u.id
-      JOIN colleges c ON c.id = ua.college_id
-      WHERE u.role = 7 AND u.status = 1
-        AND (c.college_name LIKE '%${collegeFilter}%' OR c.college_short_name LIKE '%${collegeFilter}%')
-    `;
-  } else {
-    sql = `SELECT COUNT(*) AS total FROM users WHERE role = 7 AND status = 1`;
-  }
-  const res = await runQuery(sql);
-  return { count: res.rows[0]?.total ?? 0, sql };
-}
-
-// ── Courses for a user ────────────────────────────────────────────────────────
-async function getUserCourses(userId: number) {
-  const sql = `
-    SELECT c.course_name, c.course_short_name, cws.score, cws.progress, cws.type,
-      col.college_name
-    FROM course_wise_segregations cws
-    JOIN courses c ON c.id = cws.course_id
-    LEFT JOIN colleges col ON col.id = cws.college_id
-    WHERE cws.user_id = ${Number(userId)} AND cws.status = 1
-  `;
-  const res = await runQuery(sql);
-  return { courses: res.rows, sql };
-}
-
-// ── Search users (with optional college scoping) ──────────────────────────────
-async function searchUser(searchTerm: string, collegeId?: number) {
-  // Fix #9: Escape backslashes AND single quotes to prevent SQL injection
-  const safe = searchTerm.replace(/\\/g, '\\\\').replace(/'/g, "''").replace(/[%_]/g, c => '\\' + c);
-  let collegeJoin = "";
-  let collegeWhere = "";
-  if (collegeId) {
-    collegeJoin = "JOIN user_academics ua2 ON ua2.user_id = u.id";
-    collegeWhere = `AND ua2.college_id = ${Number(collegeId)}`;
-  }
-  const sql = `
-    SELECT u.id, u.name, u.email, u.role, u.roll_no, u.status,
-      c.college_name, d.department_name, b.batch_name
-    FROM users u
-    LEFT JOIN user_academics ua ON ua.user_id = u.id
-    LEFT JOIN colleges c ON c.id = ua.college_id
-    LEFT JOIN departments d ON d.id = ua.department_id
-    LEFT JOIN batches b ON b.id = ua.batch_id
-    ${collegeJoin}
-    WHERE (u.name LIKE '%${safe}%' OR u.email LIKE '%${safe}%' OR u.roll_no LIKE '%${safe}%')
-    ${collegeWhere}
-    LIMIT 20
-  `;
-  const res = await runQuery(sql);
-  return { users: res.rows, sql };
-}
-
-// ── Top students (with optional college scoping) ──────────────────────────────
-async function getTopStudents(collegeFilter?: string, limit: number = 10, collegeId?: number) {
-  const tablesRes = await runQuery("SHOW TABLES LIKE '%\\_test\\_data'");
-  const tables = (tablesRes.rows || []).map((r: any) => Object.values(r)[0] as string);
-
-  if (tables.length === 0) return { students: [], sql: "" };
-
-  let filteredTables = tables;
-  if (collegeFilter) {
-    const lc = collegeFilter.toLowerCase();
-    filteredTables = tables.filter((t: string) => t.toLowerCase().startsWith(lc));
-    if (filteredTables.length === 0) filteredTables = tables;
-  }
-
-  const unionPart = filteredTables.map((t: string) => `
-    SELECT user_id,
-      JSON_EXTRACT(mark, '$.co') AS co, JSON_EXTRACT(total_mark, '$.co') AS co_total,
-      JSON_EXTRACT(mark, '$.mcq') AS mcq, JSON_EXTRACT(total_mark, '$.mcq') AS mcq_total
-    FROM \`${t}\` WHERE status = 1
-  `).join(" UNION ALL ");
-
-  let collegeWhere = "";
-  if (collegeId) {
-    collegeWhere = `AND ua.college_id = ${Number(collegeId)}`;
-  }
-
-  const sql = `
-    WITH all_scores AS (${unionPart})
-    SELECT u.name, u.email, u.roll_no, col.college_name,
-      ROUND(SUM(a.co) * 100.0 / NULLIF(SUM(a.co_total), 0), 2) AS coding_pct,
-      ROUND(SUM(a.mcq) * 100.0 / NULLIF(SUM(a.mcq_total), 0), 2) AS mcq_pct,
-      ROUND((SUM(a.co) + SUM(a.mcq)) * 100.0 / NULLIF(SUM(a.co_total) + SUM(a.mcq_total), 0), 2) AS overall_pct,
-      COUNT(*) AS modules
-    FROM all_scores a
-    JOIN users u ON u.id = a.user_id AND u.role = 7 AND u.status = 1
-    LEFT JOIN user_academics ua ON ua.user_id = u.id
-    LEFT JOIN colleges col ON col.id = ua.college_id
-    WHERE 1=1 ${collegeWhere}
-    GROUP BY a.user_id, u.name, u.email, u.roll_no, col.college_name
-    HAVING modules >= 3
-    ORDER BY overall_pct DESC
-    LIMIT ${Number(limit)}
-  `;
-
-  const res = await runQuery(sql);
-  return { students: res.rows, sql };
 }
 
 
@@ -903,7 +646,7 @@ async function handleWithTools(
 
   let followUpContext = "";
   if (history && history.length > 0) {
-    const contextExchanges = history.slice(-4);
+    const contextExchanges = history.slice(-6);
     followUpContext = `
 PREVIOUS CONVERSATION CONTEXT:
 ${contextExchanges.map(h => `${h.role === 'user' ? 'Question' : 'Answer'}: ${h.content}`).join('\n')}
@@ -922,8 +665,9 @@ ${followUpContext}
 ${buildRoleTailoredSchema(roleNum)}
 
 QUERY SHORTCUTS:
-- "coding solved/scores" → course_wise_segregations WHERE type = 1
-- "MCQ scores/accuracy" → course_wise_segregations WHERE type = 2
+- "coding/mcq scores (prepare)" → course_wise_segregations WHERE type = 1
+- "coding/mcq scores (assessment)" → course_wise_segregations WHERE type = 2
+- Each CWS row has BOTH coding_question and mcq_question JSON — type is prepare vs assessment, NOT coding vs MCQ!
 - "enrolled courses" → course_wise_segregations or user_course_enrollments WHERE user_id = X
 ${!isStudentRole ? `- "allocated courses" → COUNT from course_academic_maps (NOT courses table)
 - "available courses" → courses WHERE status = 1
@@ -1066,6 +810,7 @@ RESPONSE STYLE:
     tools,
     stopWhen: stepCountIs(8),
     temperature: 0,
+    // maxOutputTokens: 2048,
   });
 
   for (const step of result.steps ?? []) {
@@ -1080,9 +825,30 @@ RESPONSE STYLE:
   const stepsUsed = result.steps?.length ?? 1;
   let report = result.text?.trim() || "";
 
-  // Fix F: If we hit max steps and got garbage output, generate a clean fallback
+  // Fix F: If we hit max steps and got garbage output, try to summarize collected data
   if (stepsUsed >= 8 && (!report || report.toLowerCase().includes('let me fix') || report.toLowerCase().includes('let me try'))) {
-    report = "I gathered some data but ran into query complexity. Here's what I found so far. Please try rephrasing your question or asking something more specific.";
+    // Collect all successful tool results with data
+    const allData = result.steps?.flatMap(s =>
+      ((s.toolResults ?? []) as any[])
+        .filter(tr => tr.result?.rows?.length > 0)
+        .map(tr => tr.result)
+    ) || [];
+
+    if (allData.length > 0) {
+      try {
+        const summary = await generateText({
+          model: chatModel,
+          system: 'Summarize this query data into a clean, concise report. No error messages. Format with markdown tables if appropriate.',
+          messages: [{ role: 'user' as const, content: JSON.stringify(allData.slice(0, 5)) }],
+          maxOutputTokens: 1024,
+          temperature: 0,
+        });
+        report = summary.text?.trim() || report;
+      } catch { /* keep original fallback */ }
+    }
+    if (!report || report.toLowerCase().includes('let me')) {
+      report = "I gathered some data but ran into query complexity. Please try rephrasing or asking something more specific.";
+    }
   }
 
   return {
@@ -1153,6 +919,7 @@ async function handleDbQuestion(
         system: GENERAL_KNOWLEDGE_PROMPT,
         messages: [...(history as any), { role: "user" as const, content: question.trim() }],
         temperature: 0.4,
+        maxOutputTokens: 512,
       });
       return { report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 };
     } catch (err) {
