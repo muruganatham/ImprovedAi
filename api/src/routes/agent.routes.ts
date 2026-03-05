@@ -236,8 +236,9 @@ async function loadSchemaCache() {
     schema += `  (⚠️ backticks REQUIRED — table names start with numbers!)\n`;
     schema += `  mode: 1=mcq/fillups, 2=coding | type: 1=prepare, 2=assessment\n`;
     schema += `  period: month number\n`;
-    schema += `  attended_count_details: JSON {"YYYY-MM-DD": [question_ids]}\n`;
-    schema += `  solved_count_details: JSON {"YYYY-MM-DD": [question_ids]}\n\n`;
+    schema += `  COLUMNS: attended_count_details (JSON), solved_count_details (JSON)\n`;
+    schema += `  ⚠️ THESE COLUMNS DO NOT EXIST: attended_count, solved_count — NEVER USE THEM!\n`;
+    schema += `  → To count: use JSON_LENGTH(attended_count_details) or extract keys\n\n`;
 
     schema += `CERTIFICATES: verify_certificates table\n`;
     schema += `  user_id, course_id, college_id, total_mark, mark_obtained, percentage, grade, p_id\n\n`;
@@ -855,21 +856,25 @@ QUERY SHORTCUTS:
 - "trainer count" → users WHERE role = 5 AND status = 1
 - "my trainer" → course_wise_segregations → course_academic_maps → course_staff_trainer_allocations
 
+CRITICAL RULES (MUST FOLLOW):
+██ ONE QUERY PER TOOL CALL. Never combine SQL with semicolons. If you need multiple queries, make SEPARATE run_sql calls. Any query with ; will be rejected.
+██ EFFICIENCY: For "my progress/performance/scores" → query course_wise_segregations ONCE and STOP. That table has pre-computed progress%, score, rank, and JSON breakdowns. Do NOT also query dynamic result tables unless the user specifically asks for question-level details. Target: 1-2 steps for overview, 2-3 for deep dives.
+██ NO REPEATS: Never query the same table twice. If you already have CWS data, do NOT re-query it with a date filter. CWS has updated_at for recency.
+
 RULES:
 1. You already have the full schema above — go DIRECTLY to run_sql. Only use list_tables/describe_table for tables NOT in the schema.
 2. Only SELECT queries allowed
 3. Always filter status = 1 for active records
 4. Format answer as markdown with tables where appropriate
-5. Be efficient — most queries need only 1-2 run_sql calls
-6. Present data clearly with counts, percentages, and comparisons
-7. For JOINs: users → user_academics (user_id) → colleges (college_id) → departments (department_id)
-8. ERROR ANALYSIS: When the student asks about errors or how to improve:
+5. Present data clearly with counts, percentages, and comparisons
+6. For JOINs: users → user_academics (user_id) → colleges (college_id) → departments (department_id)
+7. ERROR ANALYSIS: When the student asks about errors or how to improve:
    a. Query the errors column (JSON) from coding_result tables
    b. Identify the error type (compilation, runtime, logic)
    c. Explain what caused it in simple terms
    d. Show the fix with a code example using ❌ (wrong) and ✅ (correct)
-   e. Look for error PATTERNS across questions (e.g., "you keep confusing char with String")
-9. DEEP DIVE: For detailed course/topic analysis:
+   e. Look for error PATTERNS across questions
+8. DEEP DIVE: For detailed course/topic analysis:
    a. First get courses from course_wise_segregations
    b. Then get topics from course_academic_maps using the course_id + college_id
    c. Then get per-question results from dynamic tables using course_allocation_id = cam.id
@@ -913,7 +918,17 @@ RULES:
         try {
           const query = args?.query || args?.sql || (typeof args === 'string' ? args : '');
           if (!query) return { error: "No query provided" };
-          const cleaned = query.trim().replace(/^```(sql)?\s*/i, "").replace(/\s*```$/i, "").trim();
+          let cleaned = query.trim().replace(/^```(sql)?\s*/i, "").replace(/\s*```$/i, "").trim();
+
+          // HARD BLOCK: reject multi-statement queries (semicolons)
+          // Only keep the first statement if LLM crammed multiple
+          if (cleaned.includes(';')) {
+            const firstStatement = cleaned.split(';')[0].trim();
+            if (firstStatement) {
+              cleaned = firstStatement;
+              logger.warn(`[run_sql] Multi-statement query detected — trimmed to first statement`);
+            }
+          }
 
           if (!cleaned.toLowerCase().startsWith("select")) {
             return { error: "Only SELECT queries allowed" };
