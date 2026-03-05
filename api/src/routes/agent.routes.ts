@@ -906,8 +906,8 @@ async function handleWithTools(
 PREVIOUS CONVERSATION CONTEXT:
 ${contextExchanges.map(h => `${h.role === 'user' ? 'Question' : 'Answer'}: ${h.content}`).join('\n')}
 
-The user is likely asking a FOLLOW-UP question.
-Reuse the relevant tables/filters from the previous queries above to answer this.`;
+IMPORTANT: If the user's current question was ALREADY answered in the conversation above, respond with that answer directly. Do NOT run any SQL queries.
+If it's a follow-up question, reuse the relevant tables/filters from the previous queries above.`;
   }
 
   const systemPrompt = `You are Devora AI — expert SQL analyst for coderv4 database (TiDB/MySQL).
@@ -940,14 +940,15 @@ RULES:
 3. Always filter status = 1 for active records
 4. Format answer as markdown with tables where appropriate
 5. Present data clearly with counts, percentages, and comparisons
-6. For JOINs: users → user_academics (user_id) → colleges (college_id) → departments (department_id)
-7. ERROR ANALYSIS: When the student asks about errors or how to improve:
+6. Answer EXACTLY what was asked — nothing more. If user asks "how many students?", return the count. Do NOT add college breakdown, gender breakdown, or extra analytics unless specifically requested.
+7. For JOINs: users → user_academics (user_id) → colleges (college_id) → departments (department_id)
+8. ERROR ANALYSIS: When the student asks about errors or how to improve:
    a. Query the errors column (JSON) from coding_result tables
    b. Identify the error type (compilation, runtime, logic)
    c. Explain what caused it in simple terms
    d. Show the fix with a code example using ❌ (wrong) and ✅ (correct)
    e. Look for error PATTERNS across questions
-8. DEEP DIVE: For detailed course/topic analysis:
+9. DEEP DIVE: For detailed course/topic analysis:
    a. First get courses from course_wise_segregations
    b. Then get topics from course_academic_maps using the course_id + college_id
    c. Then get per-question results from dynamic tables using course_allocation_id = cam.id
@@ -1074,6 +1075,32 @@ RULES:
 // MAIN HANDLER
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
+// ═══════════════════════════════════════════════════════════════════════════
+// HISTORY PRE-CHECK — Don't call LLM if the answer is already in history
+// ═══════════════════════════════════════════════════════════════════════════
+
+function findAnswerInHistory(
+  history: Array<{ role: string, content: string }>,
+  question: string
+): string | null {
+  if (!history || history.length < 2) return null;
+
+  const normalize = (s: string) => s.toLowerCase().trim().replace(/[?.!,;]+$/g, '').replace(/\s+/g, ' ');
+  const q = normalize(question);
+
+  // Walk backwards through history looking for exact same question
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].role === 'user') {
+      const prev = normalize(history[i].content);
+      if (prev === q && i + 1 < history.length && history[i + 1].role === 'assistant') {
+        return history[i + 1].content;
+      }
+    }
+  }
+  return null;
+}
+
+
 async function handleDbQuestion(
   question: string,
   userId: string,
@@ -1087,6 +1114,13 @@ async function handleDbQuestion(
   const route = preRouteQuestion(question.trim());
 
   logger.info(`Agent chat (${options.version})`, { userId, role: roleNum, route, question: question.slice(0, 80) });
+
+  // ── HISTORY PRE-CHECK: Return cached answer instantly ──
+  const cachedAnswer = findAnswerInHistory(history, question);
+  if (cachedAnswer) {
+    logger.info(`[history-cache] HIT — returning cached answer for: "${question.slice(0, 50)}"`);
+    return { report: cachedAnswer, sql: null, steps: 0 };
+  }
 
   // ── GREETING (instant, personalized) ──
   if (route === "greeting") {
