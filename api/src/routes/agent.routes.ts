@@ -120,7 +120,7 @@ async function runQuery(sql: string): Promise<{ rows: any[]; sql: string; error?
 // SCHEMA CACHE — Load once at startup, reuse forever (refresh 30 min)
 // Eliminates 3-4 tool steps per query (no more list_tables + describe_table)
 // ═══════════════════════════════════════════════════════════════
-let cachedSchemaPrompt = "";
+let cachedTableSchemas: Record<string, string> = {};
 
 const SCHEMA_TABLES = [
   'users', 'user_academics', 'colleges', 'departments',
@@ -133,130 +133,165 @@ const SCHEMA_TABLES = [
 
 async function loadSchemaCache() {
   try {
-    let schema = "DATABASE SCHEMA (live from DB — use these columns directly):\n";
+    const newCache: Record<string, string> = {};
     for (const table of SCHEMA_TABLES) {
       const res = await runQuery(`DESCRIBE \`${table}\``);
       if (res.rows && res.rows.length > 0) {
-        const columns = res.rows.map((r: any) => r.Field).join(', ');
-        schema += `- ${table}: ${columns}\n`;
+        let columns = res.rows.map((r: any) => r.Field).join(', ');
+        newCache[table] = columns;
       }
     }
-    schema += `\nENUM VALUES (use EXACT numbers, never strings):\n`;
+    cachedTableSchemas = newCache;
+    logger.info(`[schema-cache] Cached ${Object.keys(cachedTableSchemas).length} table schemas`);
+  } catch (err: any) {
+    logger.error(`[schema-cache] Failed to load schema: ${err.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ROLE-TAILORED SCHEMA BUILDER
+// ═══════════════════════════════════════════════════════════════
+function buildRoleTailoredSchema(roleNum: number): string {
+  const isStudentOrContentCreator = roleNum >= 6;
+  const isCollegeScoped = roleNum >= 3 && roleNum <= 5;
+
+  let schema = "DATABASE SCHEMA (live from DB — use these columns directly):\n";
+
+  // Filter which tables to expose based on role
+  const restrictedTablesForStudents = ['users', 'institutions', 'colleges', 'departments'];
+
+  for (const [table, columns] of Object.entries(cachedTableSchemas)) {
+    if (isStudentOrContentCreator && restrictedTablesForStudents.includes(table)) {
+      continue; // Hide infrastructure tables from students
+    }
+    schema += `- ${table}: ${columns}\n`;
+  }
+
+  // --- ENUMS & STATUS ---
+  schema += `\nENUM VALUES (use EXACT numbers, never strings):\n`;
+  if (!isStudentOrContentCreator) {
     schema += `- users.role: 1=SuperAdmin, 2=Admin, 3=CollegeAdmin, 4=Staff, 5=Trainer, 6=ContentCreator, 7=Student\n`;
     schema += `- users.gender: 1=Male, 2=Female, 3=Other (NULL/0=not set)\n`;
-    schema += `- course_wise_segregations.type: 1=Coding, 2=MCQ\n`;
-    schema += `- courses.category: 1=Foundation, 2=Advanced, 3=Specialized\n`;
-    schema += `- status column (ALL tables): 1=active. Always add WHERE status=1.\n`;
+  }
+  schema += `- course_wise_segregations.type: 1=Coding, 2=MCQ\n`;
+  schema += `- courses.category: 1=Foundation, 2=Advanced, 3=Specialized\n`;
+  schema += `- status column (ALL tables): 1=active. Always add WHERE status=1.\n`;
 
-    schema += `\nDYNAMIC TABLES (per-college, per-semester):\n`;
-    schema += `Pattern: {college_short_name}_{year}_{sem}_{type}\n`;
-    schema += `Example: srec_2026_1_coding_result, skcet_2025_2_mcq_result\n`;
-    schema += `Find tables: SHOW TABLES LIKE '{short_name}_%_coding_result'\n\n`;
+  schema += `\nDYNAMIC TABLES (per-college, per-semester):\n`;
+  schema += `Pattern: {college_short_name}_{year}_{sem}_{type}\n`;
+  schema += `Example: srec_2026_1_coding_result, skcet_2025_2_mcq_result\n`;
+  if (!isStudentOrContentCreator) {
+    schema += `Find tables: SHOW TABLES LIKE '{short_name}_%_coding_result'\n`;
+  }
+  schema += `\n`;
 
-    schema += `{college}_{year}_{sem}_coding_result columns:\n`;
-    schema += `  user_id, question_id, module_id, topic_test_id, complexity\n`;
-    schema += `  solve_status (int): 0=new, 1=partial, 2=SOLVED, 3=wrong_answer\n`;
-    schema += `  mark (float): score earned. total_mark (float): max possible\n`;
-    schema += `  total_time (int): seconds spent. compile_id: language used\n`;
-    schema += `  first_submission_time, correct_submission_time (int)\n`;
-    schema += `  main_solution (text), test_cases (json), errors (json)\n`;
-    schema += `  ⚠️ "status" = row active flag (always 1), NOT solve result!\n`;
-    schema += `  ⚠️ Use solve_status=2 for "solved". NEVER status='Accepted'!\n`;
-    schema += `  ⚠️ Column is "mark" NOT "score". "total_time" NOT "execution_time".\n\n`;
+  schema += `{college}_{year}_{sem}_coding_result columns:\n`;
+  schema += `  user_id, question_id, module_id, topic_test_id, complexity\n`;
+  schema += `  solve_status (int): 0=new, 1=partial, 2=SOLVED, 3=wrong_answer\n`;
+  schema += `  mark (float): score earned. total_mark (float): max possible\n`;
+  schema += `  total_time (int): seconds spent. compile_id: language used\n`;
+  schema += `  first_submission_time, correct_submission_time (int)\n`;
+  schema += `  main_solution (text), test_cases (json), errors (json)\n`;
+  schema += `  ⚠️ "status" = row active flag (always 1), NOT solve result!\n`;
+  schema += `  ⚠️ Use solve_status=2 for "solved". NEVER status='Accepted'!\n`;
+  schema += `  ⚠️ Column is "mark" NOT "score". "total_time" NOT "execution_time".\n\n`;
 
-    schema += `{college}_{year}_{sem}_mcq_result columns:\n`;
-    schema += `  user_id, question_id, module_id, topic_test_id, complexity\n`;
-    schema += `  solve_status (int): same as coding (0/1/2/3)\n`;
-    schema += `  mark (float), total_mark (float), total_time (int)\n`;
-    schema += `  attempt_count (int), solution (text), type (tinyint)\n`;
-    schema += `  ⚠️ Same rules: solve_status=2 = solved. "mark" not "score".\n\n`;
+  schema += `{college}_{year}_{sem}_mcq_result columns:\n`;
+  schema += `  user_id, question_id, module_id, topic_test_id, complexity\n`;
+  schema += `  solve_status (int): same as coding (0/1/2/3)\n`;
+  schema += `  mark (float), total_mark (float), total_time (int)\n`;
+  schema += `  attempt_count (int), solution (text), type (tinyint)\n`;
+  schema += `  ⚠️ Same rules: solve_status=2 = solved. "mark" not "score".\n\n`;
 
-    schema += `{college}_{year}_{sem}_test_data columns:\n`;
-    schema += `  user_id, topic_test_id, module_id\n`;
-    schema += `  mark (JSON not numeric!), total_mark (JSON not numeric!)\n`;
-    schema += `  time (int), total_time (int), question_ids (json)\n`;
-    schema += `  question_status (json), attempt_datas (json)\n\n`;
+  schema += `{college}_{year}_{sem}_test_data columns:\n`;
+  schema += `  user_id, topic_test_id, module_id\n`;
+  schema += `  mark (JSON not numeric!), total_mark (JSON not numeric!)\n`;
+  schema += `  time (int), total_time (int), question_ids (json)\n`;
+  schema += `  question_status (json), attempt_datas (json)\n\n`;
 
-    schema += `QUERY HINTS:\n`;
+  schema += `QUERY HINTS:\n`;
+  if (!isStudentOrContentCreator) {
     schema += `- "allocated courses" → COUNT from course_academic_maps (NOT courses table)\n`;
     schema += `- "available courses" → courses WHERE status = 1\n`;
-    schema += `- "enrolled courses" / "my scores" → course_wise_segregations WHERE user_id = X\n`;
-    schema += `- "my trainer" → course_wise_segregations → course_academic_maps → course_staff_trainer_allocations\n`;
-    schema += `- Student progress/scores (aggregated) → course_wise_segregations (best table)\n`;
-    schema += `- Per-question details → dynamic coding_result/mcq_result tables\n\n`;
+  }
+  schema += `- "enrolled courses" / "my scores" → course_wise_segregations WHERE user_id = X\n`;
+  schema += `- "my trainer" → course_wise_segregations → course_academic_maps → course_staff_trainer_allocations\n`;
+  schema += `- Student progress/scores (aggregated) → course_wise_segregations (best table)\n`;
+  schema += `- Per-question details → dynamic coding_result/mcq_result tables\n\n`;
 
-    schema += `DATA RELATIONSHIPS (how to trace Course → Topic → Question → Result):\n`;
-    schema += `1. Student's courses: course_wise_segregations WHERE user_id = X (aggregated scores)\n`;
-    schema += `2. Course topics: course_academic_maps WHERE course_id = X AND college_id = Y\n`;
-    schema += `   → topic_name = topic label. db = semester prefix for dynamic tables.\n`;
-    schema += `3. Per-question coding: {db}_coding_result WHERE user_id = X AND course_allocation_id = cam.id\n`;
-    schema += `   → errors (JSON array): each element has {error: string, details: string}\n`;
-    schema += `   → action_counts (JSON): {att: attempts, run: runs, ver: verifications, deb: debug}\n`;
-    schema += `   → main_solution (text): the student's actual submitted code\n`;
-    schema += `4. Per-question MCQ: {db}_mcq_result WHERE user_id = X AND course_allocation_id = cam.id\n`;
-    schema += `5. Test session: {db}_test_data WHERE user_id = X\n`;
-    schema += `   → mark/total_mark are JSON: {co: coding, mcq: mcq, pro: project}\n`;
-    schema += `   → question_ids (JSON array): list of question IDs in this test\n\n`;
+  schema += `DATA RELATIONSHIPS (how to trace Course → Topic → Question → Result):\n`;
+  schema += `1. Student's courses: course_wise_segregations WHERE user_id = X (aggregated scores)\n`;
+  schema += `2. Course topics: course_academic_maps WHERE course_id = X AND college_id = Y\n`;
+  schema += `   → topic_name = topic label. db = semester prefix for dynamic tables.\n`;
+  schema += `3. Per-question coding: {db}_coding_result WHERE user_id = X AND course_allocation_id = cam.id\n`;
+  schema += `   → errors (JSON array): each element has {error: string, details: string}\n`;
+  schema += `   → action_counts (JSON): {att: attempts, run: runs, ver: verifications, deb: debug}\n`;
+  schema += `   → main_solution (text): the student's actual submitted code\n`;
+  schema += `4. Per-question MCQ: {db}_mcq_result WHERE user_id = X AND course_allocation_id = cam.id\n`;
+  schema += `5. Test session: {db}_test_data WHERE user_id = X\n`;
+  schema += `   → mark/total_mark are JSON: {co: coding, mcq: mcq, pro: project}\n`;
+  schema += `   → question_ids (JSON array): list of question IDs in this test\n\n`;
 
-    schema += `COMMON STUDENT DEEP-DIVE QUERIES:\n`;
-    schema += `- "my course details" → course_wise_segregations + courses table\n`;
-    schema += `- "topic-wise breakdown" → JOIN coding_result with course_academic_maps on course_allocation_id = cam.id\n`;
-    schema += `- "what errors did I make" → coding_result.errors JSON (array of {error, details})\n`;
-    schema += `- "how to fix my errors" → Read errors JSON, explain the compilation/runtime error\n`;
-    schema += `- "my coding attempts" → action_counts JSON: att=attempts, run=code runs, ver=test verifications\n`;
-    schema += `- "show my code" → main_solution column (text, student's submitted code)\n\n`;
+  schema += `COMMON STUDENT DEEP-DIVE QUERIES:\n`;
+  schema += `- "my course details" → course_wise_segregations + courses table\n`;
+  schema += `- "topic-wise breakdown" → JOIN coding_result with course_academic_maps on course_allocation_id = cam.id\n`;
+  schema += `- "what errors did I make" → coding_result.errors JSON (array of {error, details})\n`;
+  schema += `- "how to fix my errors" → Read errors JSON, explain the compilation/runtime error\n`;
+  schema += `- "my coding attempts" → action_counts JSON: att=attempts, run=code runs, ver=test verifications\n`;
+  schema += `- "show my code" → main_solution column (text, student's submitted code)\n\n`;
 
-    schema += `IMPORTANT — Finding dynamic tables for a student:\n`;
-    schema += `  The student's dynamic table prefixes are pre-fetched and provided in the ACCESS CONTROL section.\n`;
-    schema += `  Use those prefixes directly — do NOT query college_short_name or cam.db yourself!\n`;
+  schema += `IMPORTANT — Finding dynamic tables for a student:\n`;
+  schema += `  The student's dynamic table prefixes are pre-fetched and provided in the ACCESS CONTROL section.\n`;
+  schema += `  Use those prefixes directly — do NOT query college_short_name or cam.db yourself!\n`;
+  if (!isStudentOrContentCreator) {
     schema += `  If no prefixes are provided, query: SELECT DISTINCT cam.db FROM course_wise_segregations cws\n`;
     schema += `    JOIN course_academic_maps cam ON cws.course_allocation_id = cam.allocation_id\n`;
     schema += `    WHERE cws.user_id = {user_id} AND cam.db IS NOT NULL\n`;
     schema += `  ⚠️ cam.db may differ from college_short_name! (e.g., dotlab ≠ demolab, skacas ≠ skasc)\n\n`;
+  }
 
-    schema += `PERFORMANCE OVERVIEW (use FIRST for "how am I doing?" questions):\n`;
-    schema += `  course_wise_segregations: Pre-computed summary per user per course.\n`;
-    schema += `  Columns: progress (%), score, rank, performance_rank, time_spend (sec)\n`;
-    schema += `  JSON columns:\n`;
-    schema += `    coding_question: {total_question, attend_question, solved_question, par_question, obtain_score, total_score, code_quality}\n`;
-    schema += `    mcq_question: {total_question, attend_question, solved_question, par_question, obtain_score, total_score}\n`;
-    schema += `  JOIN: cws.course_id → courses.id for course names\n`;
-    schema += `  ⚠️ cws.course_allocation_id → cam.allocation_id (NOT cam.id!)\n`;
-    schema += `  Use CWS for overview. For question-level detail, query dynamic result tables.\n\n`;
+  schema += `PERFORMANCE OVERVIEW (use FIRST for "how am I doing?" questions):\n`;
+  schema += `  course_wise_segregations: Pre-computed summary per user per course.\n`;
+  schema += `  Columns: progress (%), score, rank, performance_rank, time_spend (sec)\n`;
+  schema += `  JSON columns:\n`;
+  schema += `    coding_question: {total_question, attend_question, solved_question, par_question, obtain_score, total_score, code_quality}\n`;
+  schema += `    mcq_question: {total_question, attend_question, solved_question, par_question, obtain_score, total_score}\n`;
+  schema += `  JOIN: cws.course_id → courses.id for course names\n`;
+  schema += `  ⚠️ cws.course_allocation_id → cam.allocation_id (NOT cam.id!)\n`;
+  schema += `  Use CWS for overview. For question-level detail, query dynamic result tables.\n\n`;
 
-    schema += `DYNAMIC TABLE ROUTING:\n`;
-    schema += `  course_academic_maps has TWO IDs — don't confuse them:\n`;
-    schema += `    cam.id (PK) → referenced as course_allocation_id in coding_result/mcq_result\n`;
-    schema += `    cam.allocation_id → referenced as course_allocation_id in course_wise_segregations\n`;
-    schema += `    cam.allocation_id → also referenced as allocate_id in some result tables\n`;
-    schema += `  cam.db = exact dynamic table prefix (e.g., "srec_2025_2")\n`;
-    schema += `  cam.type: 0=Prepare, 1=Assessment, 2=Assignment\n\n`;
+  schema += `DYNAMIC TABLE ROUTING:\n`;
+  schema += `  course_academic_maps has TWO IDs — don't confuse them:\n`;
+  schema += `    cam.id (PK) → referenced as course_allocation_id in coding_result/mcq_result\n`;
+  schema += `    cam.allocation_id → referenced as course_allocation_id in course_wise_segregations\n`;
+  schema += `    cam.allocation_id → also referenced as allocate_id in some result tables\n`;
+  schema += `  cam.db = exact dynamic table prefix (e.g., "srec_2025_2")\n`;
+  schema += `  cam.type: 0=Prepare, 1=Assessment, 2=Assignment\n\n`;
 
-    schema += `DAILY ACTIVITY: \`2025_submission_tracks\` and \`2026_submission_tracks\`\n`;
-    schema += `  (⚠️ backticks REQUIRED — table names start with numbers!)\n`;
-    schema += `  mode: 1=mcq/fillups, 2=coding | type: 1=prepare, 2=assessment\n`;
-    schema += `  period: month number\n`;
-    schema += `  COLUMNS: attended_count_details (JSON), solved_count_details (JSON)\n`;
-    schema += `  ⚠️ THESE COLUMNS DO NOT EXIST: attended_count, solved_count — NEVER USE THEM!\n`;
-    schema += `  → To count: use JSON_LENGTH(attended_count_details) or extract keys\n\n`;
+  schema += `DAILY ACTIVITY: \`2025_submission_tracks\` and \`2026_submission_tracks\`\n`;
+  schema += `  (⚠️ backticks REQUIRED — table names start with numbers!)\n`;
+  schema += `  mode: 1=mcq/fillups, 2=coding | type: 1=prepare, 2=assessment\n`;
+  schema += `  period: month number\n`;
+  schema += `  COLUMNS: attended_count_details (JSON), solved_count_details (JSON)\n`;
+  schema += `  ⚠️ THESE COLUMNS DO NOT EXIST: attended_count, solved_count — NEVER USE THEM!\n`;
+  schema += `  → To count: use JSON_LENGTH(attended_count_details) or extract keys\n\n`;
 
-    schema += `CERTIFICATES: verify_certificates table\n`;
-    schema += `  user_id, course_id, college_id, total_mark, mark_obtained, percentage, grade, p_id\n\n`;
+  schema += `CERTIFICATES: verify_certificates table\n`;
+  schema += `  user_id, course_id, college_id, total_mark, mark_obtained, percentage, grade, p_id\n\n`;
 
-    schema += `HIERARCHY: courses → titles (chapters) → topics (lessons)\n`;
-    schema += `  course_topic_maps: course_id → title_id → topic_id + order\n`;
-    schema += `  languages table: id → language_name (for compile_id lookups in coding_result)\n\n`;
+  schema += `HIERARCHY: courses → titles (chapters) → topics (lessons)\n`;
+  schema += `  course_topic_maps: course_id → title_id → topic_id + order\n`;
+  schema += `  languages table: id → language_name (for compile_id lookups in coding_result)\n\n`;
 
+  if (!isStudentOrContentCreator) {
     schema += `ROLE MAPPING: users.role integer values:\n`;
     schema += `  1=Super Admin, 2=Admin, 3=College Admin, 4=Staff, 5=Trainer, 6=Content Creator, 7=Student\n\n`;
 
     schema += `AI USAGE COLUMNS (users table):\n`;
     schema += `  stats_chat_count (int), stats_words_generated (bigint), active_streak (int), last_active_date\n`;
-    cachedSchemaPrompt = schema;
-    logger.info(`[schema-cache] Cached ${SCHEMA_TABLES.length} table schemas`);
-  } catch (err: any) {
-    logger.error(`[schema-cache] Failed to load schema: ${err.message}`);
   }
+
+  return schema;
 }
 
 // Load on startup + refresh every 30 minutes
@@ -571,7 +606,19 @@ function buildScopePrompt(
   // Security rules apply to ALL roles
   prompt += `SECURITY RULES (apply to ALL roles):\n`;
   prompt += `- NEVER return passwords, tokens, API keys, OTPs from any table.\n`;
-  prompt += `- NEVER expose password columns even if asked directly.\n\n`;
+  prompt += `- NEVER expose password columns even if asked directly.\n`;
+
+  // Student/Content Creator specific security rules
+  if (roleNum >= 6) {
+    prompt += `\nSECURITY: NEVER reveal internal details to students:\n`;
+    prompt += `- No table names, column names, or database structure\n`;
+    prompt += `- No technology stack (MySQL, TiDB, etc.)\n`;
+    prompt += `- No architecture diagrams or system design\n`;
+    prompt += `- No business metrics (number of colleges, courses, users)\n`;
+    prompt += `- If asked about system/architecture, respond with: 'Amypo LMS is a comprehensive learning platform with coding practice, assessments, and AI-powered assistance. For technical details, please contact your administrator.'\n`;
+  }
+
+  prompt += `\n`;
 
   // -- PERSONAL scope: user asking about their own data --
   if (scope === "personal") {
@@ -705,6 +752,32 @@ function preRouteQuestion(q: string): "general" | "db" | "greeting" {
     // Likely asking about a person — route to DB so classifier can handle it
     return "db";
   }
+
+  // LAYER 0 SECURITY: Catch prompt injection / instruction overrides early
+  const injectionPatterns = [
+    /\bignore\s+(all\s+)?(previous\s+)?(instructions|rules|prompts?)\b/i,
+    /\bwhat\s+(is|are)\s+(your\s+)?(system\s+)?(prompt|instructions|rules)\b/i,
+    /\bdisregard\b/i,
+    /\byou\s+are\s+now\b/i,
+    /\bbypass\b/i,
+    /\bforget\s+(all\s+)?(previous\s+)?(instructions|rules|prompts?)\b/i
+  ];
+  if (injectionPatterns.some(p => p.test(lower))) {
+    logger.warn(`[security] Blocked prompt injection attempt: "${q}"`);
+    return "general"; // General LLM has no DB tools, so it is safe
+  }
+
+  // LAYER 1 SECURITY: Catch architecture/system inquiries and route to general
+  const architecturePatterns = [
+    /system\s*architect/i,
+    /tech(nical)?\s*stack/i,
+    /how\s*(is|does)\s*(the\s*)?(system|platform|lms|app)\s*(work|built)/i,
+    /database\s*(design|structure|schema)/i,
+    /what\s*technology/i,
+    /\bamypo\b/i,
+    /infrastructure/i,
+  ];
+  if (architecturePatterns.some(p => p.test(lower))) return "general";
 
   if (generalKnowledge.some(p => p.test(lower)) && !platformTerms.test(lower)) {
     return "general";
@@ -844,16 +917,16 @@ ${scopePrompt}
 
 ${followUpContext}
 
-${cachedSchemaPrompt}
+${buildRoleTailoredSchema(roleNum)}
 
 QUERY SHORTCUTS:
 - "coding solved/scores" → course_wise_segregations WHERE type = 1
 - "MCQ scores/accuracy" → course_wise_segregations WHERE type = 2
 - "enrolled courses" → course_wise_segregations or user_course_enrollments WHERE user_id = X
-- "allocated courses" → COUNT from course_academic_maps (NOT courses table)
+${!isStudentRole ? `- "allocated courses" → COUNT from course_academic_maps (NOT courses table)
 - "available courses" → courses WHERE status = 1
 - "student count" → users WHERE role = 7 AND status = 1
-- "trainer count" → users WHERE role = 5 AND status = 1
+- "trainer count" → users WHERE role = 5 AND status = 1` : ''}
 - "my trainer" → course_wise_segregations → course_academic_maps → course_staff_trainer_allocations
 
 CRITICAL RULES (MUST FOLLOW):
