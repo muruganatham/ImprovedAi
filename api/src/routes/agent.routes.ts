@@ -933,6 +933,8 @@ CRITICAL RULES (MUST FOLLOW):
 ██ ONE QUERY PER TOOL CALL. Never combine SQL with semicolons. If you need multiple queries, make SEPARATE run_sql calls. Any query with ; will be rejected.
 ██ EFFICIENCY: For "my progress/performance/scores" → query course_wise_segregations ONCE and STOP. That table has pre-computed progress%, score, rank, and JSON breakdowns. Do NOT also query dynamic result tables unless the user specifically asks for question-level details. Target: 1-2 steps for overview, 2-3 for deep dives.
 ██ NO REPEATS: Never query the same table twice. If you already have CWS data, do NOT re-query it with a date filter. CWS has updated_at for recency.
+██ RESERVED WORDS: Always backtick these column names — they are MySQL reserved words: \`rank\`, \`order\`, \`key\`, \`status\`, \`type\`, \`mode\`, \`time\`, \`access\`. Example: SELECT \`rank\` FROM course_wise_segregations.
+██ NAME SEARCH: When searching by name, use SHORT substrings (first 4-5 chars) with LIKE. Example: "ashmita" → WHERE name LIKE '%ashm%'. Do NOT use the full name — users often have spelling variations, middle names, or transliterations.
 
 RULES:
 1. You already have the full schema above — go DIRECTLY to run_sql. Only use list_tables/describe_table for tables NOT in the schema.
@@ -1063,10 +1065,18 @@ RULES:
     }
   }
 
+  const stepsUsed = result.steps?.length ?? 1;
+  let report = result.text?.trim() || "";
+
+  // Fix F: If we hit max steps and got garbage output, generate a clean fallback
+  if (stepsUsed >= 8 && (!report || report.toLowerCase().includes('let me fix') || report.toLowerCase().includes('let me try'))) {
+    report = "I gathered some data but ran into query complexity. Here's what I found so far. Please try rephrasing your question or asking something more specific.";
+  }
+
   return {
-    report: result.text?.trim() || "Could not generate response.",
+    report: report || "Could not generate response.",
     sql: executedSql || null,
-    steps: result.steps?.length ?? 1,
+    steps: stepsUsed,
   };
 }
 
