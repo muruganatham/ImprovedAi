@@ -575,7 +575,7 @@ async function getTopStudents(collegeFilter?: string, limit: number = 10, colleg
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SCOPE PROMPT BUILDER — Guide the LLM, don't replace it
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•ââ•â•â•â•â•â•â•â•â•â•
 
 /**
  * Builds a scope-aware security prompt for the LLM based on role + question classification.
@@ -807,12 +807,7 @@ function preRouteQuestion(q: string): "general" | "db" | "greeting" {
 
   return "db";
 }
-
-
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // LLM LAYER — Only for insights and general knowledge. NEVER for numbers.
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
 const GENERAL_KNOWLEDGE_PROMPT = `You are Devora AI — a helpful assistant for an online coding education platform.
 The user asked a general/conceptual question (NOT a data query).
 
@@ -942,7 +937,9 @@ CRITICAL RULES (MUST FOLLOW):
 ██ NO REPEATS: Never query the same table twice. If you already have CWS data, do NOT re-query it with a date filter. CWS has updated_at for recency.
 ██ RESERVED WORDS: Always backtick these column names — they are MySQL reserved words: \`rank\`, \`order\`, \`key\`, \`status\`, \`type\`, \`mode\`, \`time\`, \`access\`. Example: SELECT \`rank\` FROM course_wise_segregations.
 ██ NAME SEARCH: When searching by name, use SHORT substrings (first 4-5 chars) with LIKE. Example: "ashmita" → WHERE name LIKE '%ashm%'. Do NOT use the full name — users often have spelling variations, middle names, or transliterations.
-
+██ CWS RANKING: CWS \`rank\` is DEPARTMENT rank, NOT global. Use \`score\` for cross-department comparisons. Always label it "Dept Rank".
+██ CWS AVERAGES: When averaging scores, EXCLUDE courses with progress=0 (not started). Don't average a 900 score with a 0.
+██ CWS GROUPING: CWS has type=1 (Prepare) and type=2 (Assessment) as SEPARATE rows per course. Group by course_id first to avoid double-counting.
 RULES:
 1. You already have the full schema above — go DIRECTLY to run_sql. Only use list_tables/describe_table for tables NOT in the schema.
 2. Only SELECT queries allowed
