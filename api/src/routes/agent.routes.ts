@@ -632,6 +632,10 @@ function buildScopePrompt(
     prompt += `- For "my trainer": find via course_wise_segregations -> course_academic_maps -> course_staff_trainer_allocations.\n`;
     prompt += `- For "my courses/enrolled": query course_wise_segregations WHERE user_id = ${userId} AND status = 1.\n`;
     prompt += `- For question titles: JOIN academic_qb_codings aqc ON coding_result.question_id = aqc.id → use aqc.title\n`;
+    prompt += `- For \"course status/progress\": query CWS + courses table. Format each course as:\n`;
+    prompt += `  [Course Name]: X/Y items completed (Z%)\n`;
+    prompt += `  Get X from coding_question JSON (attend_question + solved_question) and Y from (total_question).\n`;
+    prompt += `  Use progress column for the percentage. List ALL enrolled courses, sorted by progress DESC.\n`;
     prompt += `\n--- END ACCESS CONTROL ---\n`;
     return { prompt, blocked: false };
   }
