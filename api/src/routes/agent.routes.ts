@@ -25,7 +25,15 @@ const logger = loggers.agent();
 export const agentRoutes = new Hono();
 
 // Global token tracker for the current request
-export const deepseekUsages = new Map<string, { input: number, output: number }>();
+export const deepseekUsages = new Map<string, { input: number, output: number, timestamp: number }>();
+
+// Garbage collector for token tracker (cleans up dangling pointers from DeepSeek API timeouts)
+setInterval(() => {
+  const cutoff = Date.now() - 300_000; // 5 mins
+  for (const [key, val] of deepseekUsages.entries()) {
+    if (val.timestamp < cutoff) deepseekUsages.delete(key);
+  }
+}, 60_000);
 
 const dbName = process.env.DB_NAME || "coderv4";
 const dbMock = { _id: "000000000000000000000002", type: "mysql" } as any;
@@ -58,10 +66,11 @@ function makeDeepSeekModel(modelName: "deepseek-chat" | "deepseek-reasoner" = "d
     const cloned = response.clone();
     cloned.json().then(data => {
       if (data?.usage && reqId) {
-        if (!deepseekUsages.has(reqId)) deepseekUsages.set(reqId, { input: 0, output: 0 });
+        if (!deepseekUsages.has(reqId)) deepseekUsages.set(reqId, { input: 0, output: 0, timestamp: Date.now() });
         const current = deepseekUsages.get(reqId)!;
         current.input += data.usage.prompt_tokens || 0;
         current.output += data.usage.completion_tokens || 0;
+        current.timestamp = Date.now();
       }
     }).catch(() => { });
     return response;
