@@ -4,10 +4,34 @@
  */
 
 import { generateText } from "ai";
-import { openai } from "@ai-sdk/openai";
+import { createOpenAI } from "@ai-sdk/openai";
 import { loggers } from "../logging";
 
 const logger = loggers.agent();
+
+const patchedFetch = async (url: string, options: any) => {
+  if (options?.body) {
+    try {
+      const body = JSON.parse(options.body);
+      if (Array.isArray(body.tools)) {
+        body.tools = body.tools.map((t: any) => {
+          if (t.type === "function" && t.function?.parameters && !t.function.parameters.type) {
+            t.function.parameters.type = "object";
+          }
+          return t;
+        });
+        options.body = JSON.stringify(body);
+      }
+    } catch { /* not JSON */ }
+  }
+  return fetch(url, options);
+};
+
+const deepseekProvider = createOpenAI({
+  apiKey: process.env.DEEPSEEK_API_KEY,
+  baseURL: "https://api.deepseek.com",
+  fetch: patchedFetch as any,
+});
 
 const TITLE_SYSTEM_PROMPT = `You are a title generator. Generate a concise 3-8 word title for a chat conversation.
 
@@ -47,7 +71,7 @@ export const generateChatTitle = async (
 ): Promise<string> => {
   try {
     const { text } = await generateText({
-      model: openai("gpt-4o-mini") as any,
+      model: deepseekProvider.chat("deepseek-chat"),
       system: TITLE_SYSTEM_PROMPT,
       prompt: userMessageContent.substring(0, 2000), // Limit input length
     });

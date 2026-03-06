@@ -19,7 +19,7 @@ import { databaseConnectionService } from "../services/database-connection.servi
 import { getAllAgentMeta } from "../agents";
 import { loggers } from "../logging";
 import { ROLES, canAccess, getScope, getRoleName, getSQLScope, getScopeDescription } from "../agent-lib/role-access";
-import { classifyQuestionScope } from "../agent-lib/question-classifier";
+import { classifyQuestion } from "../agent-lib/question-classifier";
 
 const logger = loggers.agent();
 export const agentRoutes = new Hono();
@@ -436,120 +436,7 @@ function buildScopePrompt(
 // ROUTING LAYER
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-function preRouteQuestion(q: string): "general" | "db" | "greeting" {
-  const lower = q.toLowerCase().trim();
 
-  const greetingPatterns = [
-    /^(hi|hello|hey|greetings|good morning|good afternoon|good evening)[^a-z0-9]*$/i
-  ];
-  if (greetingPatterns.some(p => p.test(lower))) return "greeting";
-
-  const placementPatterns = [
-    /\beligib(le|ility)\b/, /\bplacement\b/, /\bcampus (drive|hiring|recruit)\b/,
-    /\bhiring\b/, /\brecruit(ment|ing)?\b/, /\bpackage\b/, /\bsalary\b/, /\blpa\b/,
-    /\bcutoff\b/, /\bcut.?off\b/, /\bbacklog\b/,
-    /\bcompan(y|ies)\b.*\b(eligib|criteria|require|cutoff)\b/,
-    /\b(eligib|criteria|require|cutoff)\b.*\bcompan(y|ies)\b/,
-    /\btier\s*[1-5]\b.*\bcompan/,
-    /\b(tcs|infosys|wipro|cognizant|google|amazon|microsoft|zoho|flipkart|accenture|capgemini)\b.*\b(eligib|criteria|cutoff|cgpa|percent)\b/,
-    /\b(eligib|criteria|cutoff|cgpa|percent)\b.*\b(tcs|infosys|wipro|cognizant|google|amazon|microsoft|zoho|flipkart|accenture|capgemini)\b/,
-    /which compan(y|ies) (can i|am i|i can)/,
-    /\bcan i (get into|apply|join)\b/,
-  ];
-  if (placementPatterns.some(p => p.test(lower))) return "db";
-
-  const personalPatterns = [
-    /\bwho am i\b/i,
-    /\bwho i am\b/i,
-    /\bmy\s*(?:profile|details|info)\b/i,
-    /\bwhat is my\b/i,
-    /\babout myself\b/i,
-  ];
-  if (personalPatterns.some(p => p.test(lower))) return "db";
-
-  const advicePatterns = [
-    /\bhow to improve\b/, /\bhow can (they|we|i|he|she) improve\b/,
-    /\brecommend(ation)?s?\b/, /\bsuggestion?s?\b/, /\btips?\b/,
-    /\badvice\b/, /\bwhat should (they|we|i|he|she)\b/,
-    /\bhow (to|can) (learn|study|practice|prepare|get better)\b/,
-    /\bstrateg(y|ies)\b/, /\bhelp them\b/, /\bguide\b/,
-    /\bbest (way|practice|approach|method) to\b/,
-  ];
-  if (advicePatterns.some(p => p.test(lower))) {
-    const platformTerms = /student|college|batch|enrolled|score|course|result|skcet|srec|mcet|kits|skct|skcet|niet|kclas|ciet/i;
-    if (!platformTerms.test(lower)) return "general";
-  }
-
-  const generalKnowledge = [
-    /^what (is|are|was|were)\s+.+/i,
-    /^(explain|define|describe|tell me about)\s+/i,
-    /^how does\s+.+\s+work/i,
-    /^(what|who) (invented|created|discovered)\s+/i,
-    /difference between/i,
-    /^(what are (the )?benefits|advantages|disadvantages)/i,
-  ];
-  const platformTerms = /student|college|batch|enrolled|score|course|result|skcet|srec|allocated|my\s|department|mcet|kits|skct|niet|kclas|ciet/i;
-
-  // FIX #2: Check if the question references a person's name BEFORE routing to general.
-  // Without this, "tell me about muruganantham" matches "tell me about" and bypasses
-  // the classifier entirely, skipping all RBAC layers.
-  const personNameCheck = /\b(tell\s+(me\s+)?about|who\s+is|who's|explain\s+about|describe)\s+([a-z]{2,})\b/i;
-  const techTerms = /\b(java|python|c\+\+|c#|react|html|css|javascript|typescript|sql|mysql|mongodb|node|express|angular|vue|swift|kotlin|ruby|php|go|rust|dart|flutter|django|flask|spring|docker|kubernetes|git|linux|aws|azure|data\s*structures?|algorithms?|machine\s*learning|artificial\s*intelligence|web\s*dev|programming|coding|arrays?|linked\s*list|stacks?|queues?|trees?|graphs?|sorting|searching|oop|database|api|framework|loops?|functions?|variables?|courses?|modules?|topics?)\b/i;
-  if (personNameCheck.test(lower) && !techTerms.test(lower) && !platformTerms.test(lower)) {
-    // Likely asking about a person — route to DB so classifier can handle it
-    return "db";
-  }
-
-  // LAYER 0 SECURITY: Catch prompt injection / instruction overrides early
-  const injectionPatterns = [
-    /\bignore\s+(all\s+)?(previous\s+)?(instructions|rules|prompts?)\b/i,
-    /\bwhat\s+(is|are)\s+(your\s+)?(system\s+)?(prompt|instructions|rules)\b/i,
-    /\bdisregard\b/i,
-    /\byou\s+are\s+now\b/i,
-    /\bbypass\b/i,
-    /\bforget\s+(all\s+)?(previous\s+)?(instructions|rules|prompts?)\b/i
-  ];
-  if (injectionPatterns.some(p => p.test(lower))) {
-    logger.warn(`[security] Blocked prompt injection attempt: "${q}"`);
-    return "general"; // General LLM has no DB tools, so it is safe
-  }
-
-  // LAYER 1 SECURITY: Catch architecture/system inquiries and route to general
-  const architecturePatterns = [
-    /system\s*architect/i,
-    /tech(nical)?\s*stack/i,
-    /how\s*(is|does)\s*(the\s*)?(system|platform|lms|app)\s*(work|built)/i,
-    /database\s*(design|structure|schema)/i,
-    /what\s*technology/i,
-    /\bamypo\b/i,
-    /infrastructure/i,
-  ];
-  if (architecturePatterns.some(p => p.test(lower))) return "general";
-
-  if (generalKnowledge.some(p => p.test(lower)) && !platformTerms.test(lower)) {
-    return "general";
-  }
-
-  const dbPatterns = [
-    /\bhow many\b/, /\bcount\b/, /\btotal\b/, /\baverage\b/, /\bsum\b/,
-    /\bbest\b/, /\btop\b/, /\bworst\b/, /\branked?\b/, /\btopper\b/,
-    /\bcompare\b/, /\bvs\b/, /\bversus\b/,
-    /\bstudent\b/, /\bcollege\b/, /\bcourse\b/, /\bbatch\b/, /\bstaff\b/,
-    /\btrainer\b/, /\badmin\b/, /\benroll(ed|ment)?\b/,
-    /\blist\b/, /\bshow\b/, /\bgive me\b/, /\bwho\b/, /\bwhich\b/,
-    /\bfind\b/, /\bget\b/,
-    /\bscore\b/, /\bperform(ance|er)?\b/, /\bprogress\b/, /\bresult\b/,
-    /\brank\b/, /\battend(ance)?\b/, /\bsubmission\b/,
-    /\bsrec\b/, /\bskcet\b/, /\bkits\b/, /\bmcet\b/, /\bdotlab\b/,
-    /\bpython\b|\bjava\b|\bc\+\+\b|\bsql\b|\bdata science\b/,
-    /\boverview\b/, /\bdashboard\b/, /\bsummary\b/, /\bstatistic/,
-    /\bdatabase\b/, /\bdb\b/,
-    /\bplatform\b/, /\bnumbers\b/, /\blanguage\b/,
-  ];
-  if (dbPatterns.some(p => p.test(lower))) return "db";
-
-  return "db";
-}
 // LLM LAYER — Only for insights and general knowledge. NEVER for numbers.
 const GENERAL_KNOWLEDGE_PROMPT = `You are Devora AI — a helpful assistant for an online coding education platform.
 The user asked a general/conceptual question (NOT a data query).
@@ -563,8 +450,6 @@ RESPONSE RULES:
 - Format: Use **bold** for key terms. No ## headings for short answers.
 - Do NOT use emojis or icons in your response. Keep it professional and clean.
 This is NOT a database question — do not try to query anything.`;
-
-
 
 function getGreeting(userName: string, roleName: string, collegeName: string | null): string {
   // ── Student (role=7) ──
@@ -641,8 +526,6 @@ async function handleWithTools(
   const chatModel = makeDeepSeekModel("deepseek-chat");
   const roleName = getRoleName(roleNum);
   const isStudentRole = roleNum === ROLES.STUDENT;
-  const classification = classifyQuestionScope(question);
-  const scope = classification.scope;
 
   let followUpContext = "";
   if (history && history.length > 0) {
@@ -654,6 +537,10 @@ ${contextExchanges.map(h => `${h.role === 'user' ? 'Question' : 'Answer'}: ${h.c
 IMPORTANT: If the user's current question was ALREADY answered in the conversation above, respond with that answer directly. Do NOT run any SQL queries.
 If it's a follow-up question, reuse the relevant tables/filters from the previous queries above.`;
   }
+
+  // Inject the scope prompt early to be able to extract the scope
+  const scopeMatch = scopePrompt.match(/SCOPE: (\w+)/);
+  const scope = scopeMatch ? scopeMatch[1].toLowerCase() : "personal";
 
   const systemPrompt = `You are Devora AI — expert SQL analyst for coderv4 database (TiDB/MySQL).
 User: id=${userId}, role=${roleNum} (${roleName})
@@ -893,8 +780,12 @@ async function handleDbQuestion(
   options: { version: 'v1' | 'v2' }
 ) {
   const roleNum = Number(userRole) || 0;
+  const roleName = getRoleName(roleNum);
   const reasonerModel = makeDeepSeekModel("deepseek-reasoner");
-  const route = preRouteQuestion(question.trim());
+
+  // Step 1: Run through dynamic LLM classifier
+  const classificationResult = await classifyQuestion(question, roleNum, roleName);
+  const { route, scope, tables_hint } = classificationResult;
 
   logger.info(`Agent chat (${options.version})`, { userId, role: roleNum, route, question: question.slice(0, 80) });
 
@@ -935,13 +826,8 @@ async function handleDbQuestion(
     const t0 = Date.now();
     const numUserId = Number(userId);
 
-    // STEP 1: Classify the question
-    const classification = classifyQuestionScope(question);
-    const scope = classification.scope;
-    logger.info(`Question classified (${options.version})`, { userId, role: roleNum, scope, reason: classification.reason });
-
-    // STEP 2: IDENTITY fast-path (reason === 'identity' within personal scope) — instant profile, no LLM needed
-    if (classification.reason === "identity") {
+    // STEP 2: Handle IDENTITY fast-path based on updated classifier reason
+    if (classificationResult.reason === "identity") {
       const profile = await getUserProfile(numUserId);
       if (!profile) return { report: "Could not find your profile.", sql: null, steps: 1 };
       const roleName = getRoleName(profile.role);
@@ -985,7 +871,12 @@ async function handleDbQuestion(
 
     const scopeResult = buildScopePrompt(roleNum, numUserId, collegeId, scope, profile?.name, collegeShort, dynamicTables);
 
-    // STEP 4: Check if blocked (student asking restricted questions)
+    // STEP 4: Inject table hints if they exist
+    if (tables_hint && tables_hint.length > 0) {
+      scopeResult.prompt += `\nTABLES HINT (Classifier suggests checking these tables): ${tables_hint.join(', ')}\n`;
+    }
+
+    // STEP 5: Check if blocked (student asking restricted questions)
     if (scopeResult.blocked) {
       logger.info(`Agent chat complete — blocked (${options.version})`, { userId, role: roleNum, scope });
       return { report: scopeResult.blockReason || "Access denied.", sql: null, steps: 1 };
