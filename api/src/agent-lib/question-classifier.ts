@@ -40,6 +40,7 @@ export interface ClassificationResult {
     scope: QuestionScope;
     reason: string;
     tables_hint: string[];
+    usage?: { promptTokens: number; completionTokens: number };
 }
 
 const CLASSIFIER_SYSTEM_PROMPT = `You are the Security Router for an educational database.
@@ -54,6 +55,13 @@ SCOPE OPTIONS (Crucial for Security):
 - "personal": The user is asking about THEIR OWN data. (e.g., "my score", "how many did I solve", "who am I").
 - "public": Asking about catalog/general platform info WITH NO SPECIFIC USER ATTACHED. (e.g., "how many courses exist", "list colleges").
 - "restricted": Asking about OTHER PEOPLE'S data, comparing users, ranking, asking for passwords, or counting students. Examples: "top 10 students", "who is Karthick", "compare my score with Ravi", "show me all passwords".
+
+RANK/POSITION RULES (important!):
+- "my rank" / "what is my rank" / "where do I stand" / "my position" = PERSONAL
+  (student asking about their OWN rank in CWS)
+- "top 10 students" / "rank all" / "leaderboard" / "class topper" = RESTRICTED
+  (asking to see OTHER students' rankings)
+- KEY SIGNAL: "my" + rank = ALWAYS personal. Even with course name.
 
 TABLES HINT:
 If route="db", provide a list of 1-3 table names that contain the answer.
@@ -74,16 +82,16 @@ export async function classifyQuestion(question: string, roleNum: number, roleNa
 
     // SUPER FAST PATH FOR GREETINGS
     if (/^(hi|hello|hey|greetings)[^a-z0-9]*$/i.test(q)) {
-        return { route: "greeting", scope: "public", reason: "simple greeting", tables_hint: [] };
+        return { route: "greeting", scope: "public", reason: "simple greeting", tables_hint: [], usage: { promptTokens: 0, completionTokens: 0 } };
     }
 
     // SUPER FAST PATH FOR PURE IDENTITY
     if (/^\s*(who\s+am\s+i|my\s+profile)\s*\??\s*$/i.test(q)) {
-        return { route: "db", scope: "personal", reason: "identity", tables_hint: ["users", "user_academics"] };
+        return { route: "db", scope: "personal", reason: "identity", tables_hint: ["users", "user_academics"], usage: { promptTokens: 0, completionTokens: 0 } };
     }
 
     try {
-        const { text } = await generateText({
+        const { text, usage } = await generateText({
             model: deepseekProvider.chat("deepseek-chat"),
             system: CLASSIFIER_SYSTEM_PROMPT,
             messages: [
@@ -95,6 +103,7 @@ export async function classifyQuestion(question: string, roleNum: number, roleNa
 
         const cleanedText = text.replace(/^\s*\`\`\`(json)?/, "").replace(/\`\`\`\s*$/, "").trim();
         const parsed = JSON.parse(cleanedText) as ClassificationResult;
+        parsed.usage = { promptTokens: (usage as any)?.inputTokens || 0, completionTokens: (usage as any)?.outputTokens || 0 };
 
         logger.info("[LLM-Classifier]", { result: parsed });
 
@@ -113,7 +122,8 @@ export async function classifyQuestion(question: string, roleNum: number, roleNa
             route: "db",
             scope: "personal",
             reason: "fallback default",
-            tables_hint: []
+            tables_hint: [],
+            usage: { promptTokens: 0, completionTokens: 0 }
         };
     }
 }

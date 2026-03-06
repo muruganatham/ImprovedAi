@@ -24,12 +24,22 @@ import { classifyQuestion } from "../agent-lib/question-classifier";
 const logger = loggers.agent();
 export const agentRoutes = new Hono();
 
+// Global token tracker for the current request
+export const deepseekUsages = new Map<string, { input: number, output: number }>();
+
 const dbName = process.env.DB_NAME || "coderv4";
 const dbMock = { _id: "000000000000000000000002", type: "mysql" } as any;
 
 // ── DeepSeek model factory ────────────────────────────────────────────────────
 function makeDeepSeekModel(modelName: "deepseek-chat" | "deepseek-reasoner" = "deepseek-chat") {
   const patchedFetch = async (url: string, options: any) => {
+    let reqId = "";
+    // Intercept tracking ID from our custom header
+    if (options?.headers && options.headers["x-ds-tracker"]) {
+      reqId = options.headers["x-ds-tracker"];
+      delete options.headers["x-ds-tracker"]; // clean up before sending to real API
+    }
+
     if (options?.body) {
       try {
         const body = JSON.parse(options.body);
@@ -44,7 +54,17 @@ function makeDeepSeekModel(modelName: "deepseek-chat" | "deepseek-reasoner" = "d
         }
       } catch { /* not JSON */ }
     }
-    return fetch(url, options);
+    const response = await fetch(url, options);
+    const cloned = response.clone();
+    cloned.json().then(data => {
+      if (data?.usage && reqId) {
+        if (!deepseekUsages.has(reqId)) deepseekUsages.set(reqId, { input: 0, output: 0 });
+        const current = deepseekUsages.get(reqId)!;
+        current.input += data.usage.prompt_tokens || 0;
+        current.output += data.usage.completion_tokens || 0;
+      }
+    }).catch(() => { });
+    return response;
   };
 
   const provider = createOpenAI({
@@ -240,6 +260,12 @@ function buildRoleTailoredSchema(roleNum: number): string {
   schema += `- "my coding attempts" → action_counts JSON: att=attempts, run=code runs, ver=test verifications\n`;
   schema += `- "show my code" → main_solution column (text, student's submitted code)\n\n`;
 
+  schema += `CRITICAL AGENT RULES:\n`;
+  schema += `1. Use coding_result tables for per-question counts, NOT CWS JSON.\n`;
+  schema += `2. correct_submission_time is seconds elapsed — use created_at for dates!\n`;
+  schema += `3. Rank data lives in CWS → \`rank\` (backtick it!) and performance_rank columns.\n`;
+  schema += `4. Follow-up answers must match the depth of the original response.\n\n`;
+
   schema += `IMPORTANT — Finding dynamic tables for a student:\n`;
   schema += `  The student's dynamic table prefixes are pre-fetched and provided in the ACCESS CONTROL section.\n`;
   schema += `  Use those prefixes directly — do NOT query college_short_name or cam.db yourself!\n`;
@@ -379,6 +405,18 @@ function buildScopePrompt(
     prompt += `  [Course Name]: X/Y items completed (Z%)\n`;
     prompt += `  Get X from coding_question JSON (attend_question + solved_question) and Y from (total_question).\n`;
     prompt += `  Use progress column for the percentage. List ALL enrolled courses, sorted by progress DESC.\n`;
+
+    // FIX 1: Pre-inject exact active database tables related to this student so LLM stops running SHOW TABLES
+    if (collegeDynamicTables && collegeDynamicTables.length > 0) {
+      prompt += `\nYOUR DATA TABLES (Use exactly these — DO NOT RUN SHOW TABLES!):\n`;
+      for (const t of collegeDynamicTables) {
+        if (t.includes('coding_result')) prompt += `  Coding: ${t}\n`;
+        else if (t.includes('mcq_result')) prompt += `  MCQ: ${t}\n`;
+        else if (t.includes('test_data')) prompt += `  Test: ${t}\n`;
+      }
+      prompt += `  Query ALL semester tables concurrently with UNION ALL if you need full historical data.\n`;
+    }
+
     prompt += `\n--- END ACCESS CONTROL ---\n`;
     return { prompt, blocked: false };
   }
@@ -524,6 +562,7 @@ async function handleWithTools(
   scopePrompt: string,
 ) {
   const chatModel = makeDeepSeekModel("deepseek-chat");
+  const tokenTrackerId = `req-${userId}-${Date.now()}`;
   const roleName = getRoleName(roleNum);
   const isStudentRole = roleNum === ROLES.STUDENT;
 
@@ -678,7 +717,23 @@ RESPONSE STYLE:
           );
           if (!res.success) return { error: res.error, sql: cleaned };
           if (!res.data?.length) return { warning: "0 rows returned. Check your query.", sql: cleaned, rows: [] };
-          return { rows: res.data.slice(0, 200), total: res.data.length, sql: cleaned };
+
+          const maxRows = 25;
+          const totalRows = res.data.length;
+          let rowsToReturn = res.data;
+          let warningText = undefined;
+
+          if (totalRows > maxRows) {
+            rowsToReturn = res.data.slice(0, maxRows);
+            warningText = `(Showing ${maxRows} of ${totalRows} total rows. Use this sample to extrapolate or run a COUNT() query if you need true totals.)`;
+          }
+
+          return {
+            rows: rowsToReturn,
+            total: totalRows,
+            sql: cleaned,
+            ...(warningText ? { warning: warningText } : {})
+          };
         } catch (err: any) {
           return { error: `Tool error: ${err.message}` };
         }
@@ -696,10 +751,11 @@ RESPONSE STYLE:
       { role: "user" as const, content: question.trim() }
     ],
     tools,
-    stopWhen: stepCountIs(8),
+    headers: { "x-ds-tracker": tokenTrackerId } as Record<string, string>, // Passed into HTTP fetch map for accurate DeepSeek token counting
+    stopWhen: stepCountIs(8), // FIX 2: Prevents runaway agent loops (cuts out 40s+ delays)
     temperature: 0,
     // maxOutputTokens: 2048,
-  });
+  } as any);
 
   for (const step of result.steps ?? []) {
     for (const tr of (step.toolResults ?? []) as any[]) {
@@ -712,6 +768,20 @@ RESPONSE STYLE:
 
   const stepsUsed = result.steps?.length ?? 1;
   let report = result.text?.trim() || "";
+
+  // Retrieve the global token counts extracted directly from DeepSeek HTTP payloads
+  let inputToken = 0;
+  let outputToken = 0;
+  const recordedTokens = deepseekUsages.get(tokenTrackerId);
+  if (recordedTokens) {
+    inputToken = recordedTokens.input;
+    outputToken = recordedTokens.output;
+    deepseekUsages.delete(tokenTrackerId); // cleanup memory
+  } else {
+    // fallback if interceptor failed
+    inputToken = (result.usage as any)?.inputTokens || (result.usage as any)?.promptTokens || 0;
+    outputToken = (result.usage as any)?.outputTokens || (result.usage as any)?.completionTokens || 0;
+  }
 
   // Fix F: If we hit max steps and got garbage output, try to summarize collected data
   if (stepsUsed >= 8 && (!report || report.toLowerCase().includes('let me fix') || report.toLowerCase().includes('let me try'))) {
@@ -732,6 +802,8 @@ RESPONSE STYLE:
           temperature: 0,
         });
         report = summary.text?.trim() || report;
+        inputToken += (summary.usage as any)?.inputTokens || (summary.usage as any)?.promptTokens || 0;
+        outputToken += (summary.usage as any)?.outputTokens || (summary.usage as any)?.completionTokens || 0;
       } catch { /* keep original fallback */ }
     }
     if (!report || report.toLowerCase().includes('let me')) {
@@ -743,6 +815,8 @@ RESPONSE STYLE:
     report: report || "Could not generate response.",
     sql: executedSql || null,
     steps: stepsUsed,
+    inputToken,
+    outputToken,
   };
 }
 // ═══════════════════════════════════════════════════════════════════════════
@@ -785,7 +859,10 @@ async function handleDbQuestion(
 
   // Step 1: Run through dynamic LLM classifier
   const classificationResult = await classifyQuestion(question, roleNum, roleName);
-  const { route, scope, tables_hint } = classificationResult;
+  const { route, scope, tables_hint, usage: classUsage } = classificationResult;
+
+  let totalInputToken = classUsage?.promptTokens || 0;
+  let totalOutputToken = classUsage?.completionTokens || 0;
 
   logger.info(`Agent chat (${options.version})`, { userId, role: roleNum, route, question: question.slice(0, 80) });
 
@@ -793,14 +870,14 @@ async function handleDbQuestion(
   const cachedAnswer = findAnswerInHistory(history, question);
   if (cachedAnswer) {
     logger.info(`[history-cache] HIT — returning cached answer for: "${question.slice(0, 50)}"`);
-    return { report: cachedAnswer, sql: null, steps: 0 };
+    return { report: cachedAnswer, sql: null, steps: 0, inputToken: 0, outputToken: 0 };
   }
 
   // ── GREETING (instant, personalized) ──
   if (route === "greeting") {
     const profile = await getUserProfile(Number(userId));
     const roleName = getRoleName(roleNum);
-    return { report: getGreeting(profile?.name || "there", roleName, profile?.college_name || null), sql: null, steps: 0 };
+    return { report: getGreeting(profile?.name || "there", roleName, profile?.college_name || null), sql: null, steps: 0, inputToken: totalInputToken, outputToken: totalOutputToken };
   }
 
   // ── GENERAL KNOWLEDGE (no DB) ──
@@ -813,7 +890,9 @@ async function handleDbQuestion(
         temperature: 0.4,
         maxOutputTokens: 512,
       });
-      return { report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1 };
+      totalInputToken += (result.usage as any)?.inputTokens || (result.usage as any)?.promptTokens || 0;
+      totalOutputToken += (result.usage as any)?.outputTokens || (result.usage as any)?.completionTokens || 0;
+      return { report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.error(`General path error (${options.version})`, { error: msg });
@@ -829,11 +908,11 @@ async function handleDbQuestion(
     // STEP 2: Handle IDENTITY fast-path based on updated classifier reason
     if (classificationResult.reason === "identity") {
       const profile = await getUserProfile(numUserId);
-      if (!profile) return { report: "Could not find your profile.", sql: null, steps: 1 };
+      if (!profile) return { report: "Could not find your profile.", sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
       const roleName = getRoleName(profile.role);
       const report = `### User Profile\n\n| Field | Value |\n|-------|-------|\n| Name | ${profile.name} |\n| Email | ${profile.email} |\n| Role | ${roleName} |\n| Roll No | ${profile.roll_no || 'N/A'} |\n| College | ${profile.college_name || 'N/A'} |\n| Department | ${profile.department_name || 'N/A'} |\n| Batch | ${profile.batch_name || 'N/A'} |\n`;
       logger.info(`Agent chat complete — identity fast-path (${options.version})`, { userId, totalTimeMs: Date.now() - t0 });
-      return { report, sql: null, steps: 1 };
+      return { report, sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
     }
 
     // STEP 3: Build scope prompt for LLM
@@ -879,15 +958,19 @@ async function handleDbQuestion(
     // STEP 5: Check if blocked (student asking restricted questions)
     if (scopeResult.blocked) {
       logger.info(`Agent chat complete — blocked (${options.version})`, { userId, role: roleNum, scope });
-      return { report: scopeResult.blockReason || "Access denied.", sql: null, steps: 1 };
+      return { report: scopeResult.blockReason || "Access denied.", sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
     }
 
     // STEP 5: LLM with tools — the brain does the work
     logger.info(`LLM with tools (${options.version})`, { userId, role: roleNum, scope });
     const result = await handleWithTools(question, numUserId, roleNum, history, options, scopeResult.prompt);
     const totalTime = Date.now() - t0;
+
+    totalInputToken += result.inputToken || 0;
+    totalOutputToken += result.outputToken || 0;
+
     logger.info(`Agent chat complete (${options.version})`, { userId, role: roleNum, totalTimeMs: totalTime, steps: result.steps });
-    return result;
+    return { ...result, inputToken: totalInputToken, outputToken: totalOutputToken };
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
