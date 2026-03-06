@@ -108,7 +108,7 @@ export async function classifyQuestion(question: string, roleNum: number, roleNa
     }
 
     // SUPER FAST PATH FOR PURE IDENTITY
-    if (/^\s*(who\s+am\s+i|my\s+profile)\s*\??\s*$/i.test(q)) {
+    if (/^\s*(who\s+am\s+i|who\s+i\s+am|my\s+profile)\s*\??\s*$/i.test(q)) {
         return { route: "db", scope: "personal", reason: "identity", tables_hint: ["users", "user_academics"], usage: { promptTokens: 0, completionTokens: 0 } };
     }
 

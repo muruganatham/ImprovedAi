@@ -530,10 +530,53 @@ async function getUserProfile(userId: number) {
   return res.rows?.[0] || null;
 }
 
+async function getUserProfileFull(userId: number) {
+  // Query 1: Basic profile
+  const profileRes = await runQuery(`
+    SELECT u.id, u.name, u.email, u.phone_number, u.roll_no, u.dob,
+      CASE u.gender WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' ELSE 'Not set' END as gender,
+      c.id AS college_id, c.college_name, c.college_short_name,
+      d.department_name, b.batch_name, s.section_name
+    FROM users u
+    LEFT JOIN user_academics ua ON ua.user_id = u.id AND ua.status = 1
+    LEFT JOIN colleges c ON c.id = ua.college_id
+    LEFT JOIN departments d ON d.id = ua.department_id
+    LEFT JOIN batches b ON b.id = ua.batch_id
+    LEFT JOIN sections s ON s.id = ua.section_id
+    WHERE u.id = ${userId} LIMIT 1
+  `);
+  const profile = profileRes.rows?.[0] || null;
+  if (!profile) return null;
 
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// SCOPE PROMPT BUILDER — Guide the LLM, don't replace it
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•ââ•â•â•â•â•â•â•â•â•â•
+  // Query 2: Course-wise performance (aggregated)
+  const cwsRes = await runQuery(`
+    SELECT
+      c.course_name,
+      ROUND(
+        (SUM(JSON_EXTRACT(cws.coding_question,'$.obtain_score')) +
+         SUM(JSON_EXTRACT(cws.mcq_question,'$.obtain_score'))) /
+        NULLIF(
+          SUM(JSON_EXTRACT(cws.coding_question,'$.total_score')) +
+          SUM(JSON_EXTRACT(cws.mcq_question,'$.total_score')), 0
+        ) * 100, 2
+      ) AS progress_pct,
+      CONCAT(
+        FLOOR(SUM(cws.time_spend)/3600), 'h ',
+        FLOOR(MOD(SUM(cws.time_spend),3600)/60), 'm'
+      ) AS time_display,
+      MAX(cws.\`rank\`) AS dept_rank,
+      SUM(cws.score) AS total_score
+    FROM course_wise_segregations cws
+    JOIN courses c ON cws.course_id = c.id
+    WHERE cws.user_id = ${userId} AND cws.status = 1
+    GROUP BY c.course_name
+    ORDER BY progress_pct DESC
+  `);
+
+  return { profile, courses: cwsRes.rows || [] };
+}
+
+
 
 /**
  * Builds a scope-aware security prompt for the LLM based on role + question classification.
@@ -1055,6 +1098,7 @@ async function handleDbQuestion(
   consoleId: string | undefined,
   options: { version: 'v1' | 'v2' }
 ) {
+  const startTime = Date.now();
   const roleNum = Number(userRole) || 0;
   const roleName = getRoleName(roleNum);
   const reasonerModel = makeDeepSeekModel("deepseek-reasoner");
@@ -1062,6 +1106,19 @@ async function handleDbQuestion(
   // Step 1: Run through dynamic LLM classifier
   const classificationResult = await classifyQuestion(question, roleNum, roleName);
   const { route, scope, tables_hint, usage: classUsage } = classificationResult;
+
+  // IMPORTANT: We use the normalized question as the cache key to safely deduplicate identical consecutive questions,
+  // bypassing the LLM completely. We avoid classificationResult.reason because LLM reasons fluctuate wildly.
+  const responseCacheKey = `resp-${userId}-${question.trim().toLowerCase()}`;
+  const cachedResponse = getCached(responseCacheKey);
+  if (cachedResponse) {
+    logger.info(`[response-cache] HIT for user ${userId} on question: "${question.slice(0, 50)}"`);
+    return {
+      ...cachedResponse,
+      responseTime: Date.now() - startTime,
+      responseTimeSec: ((Date.now() - startTime) / 1000).toFixed(1),
+    };
+  }
 
   let totalInputToken = classUsage?.promptTokens || 0;
   let totalOutputToken = classUsage?.completionTokens || 0;
@@ -1072,14 +1129,28 @@ async function handleDbQuestion(
   const cachedAnswer = findAnswerInHistory(history, question);
   if (cachedAnswer) {
     logger.info(`[history-cache] HIT — returning cached answer for: "${question.slice(0, 50)}"`);
-    return { report: cachedAnswer, sql: null, steps: 0, inputToken: 0, outputToken: 0 };
+    return {
+      report: cachedAnswer, sql: null, steps: 0,
+      inputToken: 0, outputToken: 0,
+      responseTime: Date.now() - startTime,
+      responseTimeSec: ((Date.now() - startTime) / 1000).toFixed(1),
+    };
   }
 
   // ── GREETING (instant, personalized) ──
   if (route === "greeting") {
     const profile = await getUserProfile(Number(userId));
     const roleName = getRoleName(roleNum);
-    return { report: getGreeting(profile?.name || "there", roleName, profile?.college_name || null), sql: null, steps: 0, inputToken: totalInputToken, outputToken: totalOutputToken };
+    const elapsed = Date.now() - startTime;
+    const response = {
+      report: getGreeting(profile?.name || "there", roleName, profile?.college_name || null),
+      sql: null, steps: 0,
+      inputToken: totalInputToken, outputToken: totalOutputToken,
+      responseTime: elapsed,
+      responseTimeSec: (elapsed / 1000).toFixed(1),
+    };
+    setCache(responseCacheKey, response, 5 * 60_000);
+    return response;
   }
 
   // ── GENERAL KNOWLEDGE (no DB) ──
@@ -1094,7 +1165,16 @@ async function handleDbQuestion(
       });
       totalInputToken += (result.usage as any)?.inputTokens || (result.usage as any)?.promptTokens || 0;
       totalOutputToken += (result.usage as any)?.outputTokens || (result.usage as any)?.completionTokens || 0;
-      return { report: result.text?.trim() || "I couldn't generate an answer.", sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
+      const elapsed = Date.now() - startTime;
+      const response = {
+        report: result.text?.trim() || "I couldn't generate an answer.",
+        sql: null, steps: 1,
+        inputToken: totalInputToken, outputToken: totalOutputToken,
+        responseTime: elapsed,
+        responseTimeSec: (elapsed / 1000).toFixed(1),
+      };
+      setCache(responseCacheKey, response, 5 * 60_000);
+      return response;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       logger.error(`General path error (${options.version})`, { error: msg });
@@ -1104,17 +1184,75 @@ async function handleDbQuestion(
 
   // ── DB QUESTION: Classify → Scope → LLM ──
   try {
-    const t0 = Date.now();
     const numUserId = Number(userId);
 
-    // STEP 2: Handle IDENTITY fast-path based on updated classifier reason
+    // STEP 2: Handle IDENTITY fast-path — rich profile, zero LLM calls
     if (classificationResult.reason === "identity") {
-      const profile = await getUserProfile(numUserId);
-      if (!profile) return { report: "Could not find your profile.", sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
-      const roleName = getRoleName(profile.role);
-      const report = `### User Profile\n\n| Field | Value |\n|-------|-------|\n| Name | ${profile.name} |\n| Email | ${profile.email} |\n| Role | ${roleName} |\n| Roll No | ${profile.roll_no || 'N/A'} |\n| College | ${profile.college_name || 'N/A'} |\n| Department | ${profile.department_name || 'N/A'} |\n| Batch | ${profile.batch_name || 'N/A'} |\n`;
-      logger.info(`Agent chat complete — identity fast-path (${options.version})`, { userId, totalTimeMs: Date.now() - t0 });
-      return { report, sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
+      const data = await getUserProfileFull(numUserId);
+      const elapsed = Date.now() - startTime;
+
+      if (!data) {
+        const response = {
+          report: "Could not find your profile.",
+          sql: null, steps: 0,
+          inputToken: totalInputToken, outputToken: totalOutputToken,
+          responseTime: elapsed,
+          responseTimeSec: (elapsed / 1000).toFixed(1),
+        };
+        setCache(responseCacheKey, response, 5 * 60_000);
+        return response;
+      }
+
+      const p = data.profile;
+      const roleName = getRoleName(p.role || roleNum);
+
+      // Build rich markdown report (same quality as LLM but instant)
+      let report = `## Your Profile\n\n`;
+      report += `**Personal Information:**\n`;
+      report += `- **Name:** ${p.name}\n`;
+      report += `- **Email:** ${p.email}\n`;
+      report += `- **Roll Number:** ${p.roll_no || 'N/A'}\n`;
+      if (p.dob) report += `- **Date of Birth:** ${new Date(p.dob).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}\n`;
+      if (p.gender && p.gender !== 'Not set') report += `- **Gender:** ${p.gender}\n`;
+      report += `\n**Academic Information:**\n`;
+      report += `- **College:** ${p.college_name || 'N/A'}\n`;
+      report += `- **Department:** ${p.department_name || 'N/A'}\n`;
+      report += `- **Batch:** ${p.batch_name || 'N/A'}\n`;
+      if (p.section_name) report += `- **Section:** ${p.section_name}\n`;
+
+      if (data.courses.length > 0) {
+        report += `\n**Current Course Progress:**\n\n`;
+        report += `| Course | Progress | Time Spent | Dept Rank | Score |\n`;
+        report += `|--------|----------|------------|-----------|-------|\n`;
+        for (const c of data.courses) {
+          report += `| ${c.course_name} | ${c.progress_pct || 0}% | ${c.time_display} | ${c.dept_rank || '-'} | ${c.total_score || 0} |\n`;
+        }
+        report += `\n**Summary:**\n`;
+        report += `You're currently enrolled in ${data.courses.length} course${data.courses.length > 1 ? 's' : ''}. `;
+        const best = data.courses[0];
+        if (best) {
+          report += `Your strongest progress is in **${best.course_name}** at ${best.progress_pct || 0}% completion.`;
+        }
+        report += `\n\nWant to see a detailed breakdown for any course?`;
+      } else {
+        report += `\nNo course enrollments found yet.`;
+      }
+
+      logger.info(`Agent chat complete — identity fast-path`, {
+        userId, totalTimeMs: elapsed
+      });
+
+      const response = {
+        report,
+        sql: null,
+        steps: 0,
+        inputToken: totalInputToken,
+        outputToken: totalOutputToken,
+        responseTime: elapsed,
+        responseTimeSec: (elapsed / 1000).toFixed(1),
+      };
+      setCache(responseCacheKey, response, 5 * 60_000);
+      return response;
     }
 
     // STEP 3: Build scope prompt for LLM
@@ -1160,19 +1298,36 @@ async function handleDbQuestion(
     // STEP 5: Check if blocked (student asking restricted questions)
     if (scopeResult.blocked) {
       logger.info(`Agent chat complete — blocked (${options.version})`, { userId, role: roleNum, scope });
-      return { report: scopeResult.blockReason || "Access denied.", sql: null, steps: 1, inputToken: totalInputToken, outputToken: totalOutputToken };
+      const elapsed = Date.now() - startTime;
+      const response = {
+        report: scopeResult.blockReason || "Access denied.",
+        sql: null, steps: 1,
+        inputToken: totalInputToken, outputToken: totalOutputToken,
+        responseTime: elapsed,
+        responseTimeSec: (elapsed / 1000).toFixed(1),
+      };
+      setCache(responseCacheKey, response, 5 * 60_000);
+      return response;
     }
 
     // STEP 5: LLM with tools — the brain does the work
     logger.info(`LLM with tools (${options.version})`, { userId, role: roleNum, scope });
     const result = await handleWithTools(question, numUserId, roleNum, history, options, scopeResult.prompt);
-    const totalTime = Date.now() - t0;
+    const totalTime = Date.now() - startTime;
 
     totalInputToken += result.inputToken || 0;
     totalOutputToken += result.outputToken || 0;
 
     logger.info(`Agent chat complete (${options.version})`, { userId, role: roleNum, totalTimeMs: totalTime, steps: result.steps });
-    return { ...result, inputToken: totalInputToken, outputToken: totalOutputToken };
+    const response = {
+      ...result,
+      inputToken: totalInputToken,
+      outputToken: totalOutputToken,
+      responseTime: totalTime,
+      responseTimeSec: (totalTime / 1000).toFixed(1),
+    };
+    setCache(responseCacheKey, response, 5 * 60_000);
+    return response;
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
