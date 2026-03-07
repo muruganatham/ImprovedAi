@@ -1,11 +1,4 @@
-/**
- * Role Access Matrix — Single source of truth for permissions
- *
- * Controls who can see what data. Every permission check flows through here.
- * Edit ONE place to change access rules.
- */
 
-// ── Role definitions ──
 export const ROLES = {
     SUPER_ADMIN: 1,
     ADMIN: 2,
