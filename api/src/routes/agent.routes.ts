@@ -275,7 +275,7 @@ function buildRoleTailoredSchema(roleNum: number): string {
 
 IDENTITY / "who am I?" / profile queries:
   Use ONE query to get profile + all course stats:
-  SELECT u.name, u.email, u.phone_number, u.roll_no, u.dob,
+  SELECT u.name, u.email, u.contact_number, u.roll_no, u.dob,
     CASE u.gender WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' END as gender,
     c.college_name, d.department_name, b.batch_name, s.section_name,
     ua.academic_info, ua.personal_info,
@@ -568,7 +568,7 @@ async function getUserProfile(userId: number) {
 async function getUserProfileFull(userId: number) {
   // Query 1: Basic profile
   const profileRes = await runQuery(`
-    SELECT u.id, u.name, u.email, u.phone_number, u.roll_no, u.dob,
+    SELECT u.id, u.name, u.email, u.contact_number, u.roll_no, u.dob,
       CASE u.gender WHEN 0 THEN 'Male' WHEN 1 THEN 'Female' WHEN 2 THEN 'Other' ELSE 'Not set' END as gender,
       c.id AS college_id, c.college_name, c.college_short_name,
       d.department_name, b.batch_name, s.section_name
@@ -580,8 +580,17 @@ async function getUserProfileFull(userId: number) {
     LEFT JOIN sections s ON s.id = ua.section_id
     WHERE u.id = ${userId} LIMIT 1
   `);
+
+  if (profileRes.error) {
+    logger.error(`[getUserProfileFull] Query 1 failed for user ${userId}: ${profileRes.error}`);
+    return null;
+  }
+
   const profile = profileRes.rows?.[0] || null;
-  if (!profile) return null;
+  if (!profile) {
+    logger.warn(`[getUserProfileFull] No profile found for user ${userId}`);
+    return null;
+  }
 
   // Query 2: Course-wise performance (aggregated)
   const cwsRes = await runQuery(`
@@ -607,6 +616,10 @@ async function getUserProfileFull(userId: number) {
     GROUP BY c.course_name
     ORDER BY progress_pct DESC
   `);
+
+  if (cwsRes.error) {
+    logger.error(`[getUserProfileFull] Query 2 failed for user ${userId}: ${cwsRes.error}`);
+  }
 
   return { profile, courses: cwsRes.rows || [] };
 }
@@ -1200,11 +1213,103 @@ async function handleDbQuestion(
     };
   }
 
+  // STEP 2: Handle IDENTITY fast-path — rich profile, zero LLM calls
+  const IDENTITY_PATTERNS = /\b(who\s+(am\s+i|i\s+am)|my\s+name|my\s+profile|my\s+details|tell\s+me\s+about\s+(myself|me)|about\s+me)\b/i;
+
+  if (classificationResult.reason === "identity" || IDENTITY_PATTERNS.test(question)) {
+
+    const data = await getUserProfileFull(numericUserId);
+
+    if (!data) {
+      // Profile not found in fast-path — return immediately to avoid 50s LLM timeout
+      logger.info(`[identity] Fast-path returned null for user ${numericUserId}, returning not found`);
+      const elapsed = Date.now() - startTime;
+      const response = {
+        report: "I couldn't find your profile details. Please make sure your user ID is registered on the platform.",
+        sql: null,
+        steps: 0,
+        inputToken: totalInputToken, outputToken: totalOutputToken,
+        responseTime: elapsed,
+        responseTimeSec: (elapsed / 1000).toFixed(1),
+      };
+      setCache(responseCacheKey, response, 5 * 60_000);
+      return response;
+    } else {
+
+      const p = data.profile;
+      const profileRoleName = getRoleName(p.role || roleNum);
+
+      // Build rich markdown report (same quality as LLM but instant)
+      let report = `## Your Profile\n\n`;
+      report += `**Personal Information:**\n`;
+      report += `- **Name:** ${p.name}\n`;
+      report += `- **Email:** ${p.email}\n`;
+      report += `- **Roll Number:** ${p.roll_no || 'N/A'}\n`;
+      if (p.dob) report += `- **Date of Birth:** ${new Date(p.dob).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}\n`;
+      if (p.gender && p.gender !== 'Not set') report += `- **Gender:** ${p.gender}\n`;
+      report += `\n**Academic Information:**\n`;
+      report += `- **College:** ${p.college_name || 'N/A'}\n`;
+      report += `- **Department:** ${p.department_name || 'N/A'}\n`;
+      report += `- **Batch:** ${p.batch_name || 'N/A'}\n`;
+      if (p.section_name) report += `- **Section:** ${p.section_name}\n`;
+      report += `\n**Account Role:** ${profileRoleName}\n`;
+
+      if (data.courses.length > 0) {
+        report += `\n**Current Course Progress:**\n\n`;
+        report += `| Course | Progress | Time Spent | Dept Rank | Score |\n`;
+        report += `|--------|----------|------------|-----------|-------|\n`;
+        for (const c of data.courses) {
+          report += `| ${c.course_name} | ${c.progress_pct || 0}% | ${c.time_display} | ${c.dept_rank || '-'} | ${c.total_score || 0} |\n`;
+        }
+        report += `\n**Summary:**\n`;
+        report += `You're currently enrolled in ${data.courses.length} course${data.courses.length > 1 ? 's' : ''}. `;
+        const best = data.courses[0];
+        if (best) {
+          report += `Your strongest progress is in **${best.course_name}** at ${best.progress_pct || 0}% completion.`;
+        }
+        report += `\n\nWant to see a detailed breakdown for any course?`;
+      } else {
+        report += `\nNo course enrollments found yet.`;
+      }
+
+      logger.info(`Agent chat complete — identity fast-path`, {
+        userId, totalTimeMs: Date.now() - startTime
+      });
+
+      const identityElapsed = Date.now() - startTime;
+      const response = {
+        report,
+        sql: null,
+        steps: 0,
+        inputToken: totalInputToken,
+        outputToken: totalOutputToken,
+        responseTime: identityElapsed,
+        responseTimeSec: (identityElapsed / 1000).toFixed(1),
+      };
+      setCache(responseCacheKey, response, 5 * 60_000);
+      return response;
+    } // end of else (data found)
+  } // end of identity fast-path
+
   // ── GREETING (instant, personalized) ──
   if (route === "greeting") {
     const elapsed = Date.now() - startTime;
     const response = {
       report: getGreeting(profile?.name || "there", roleName, profile?.college_name || null),
+      sql: null, steps: 0,
+      inputToken: totalInputToken, outputToken: totalOutputToken,
+      responseTime: elapsed,
+      responseTimeSec: (elapsed / 1000).toFixed(1),
+    };
+    setCache(responseCacheKey, response, 5 * 60_000);
+    return response;
+  }
+
+  // ── HARD BLOCK: restricted scope for students on general route ──
+  if (route === "general" && scope === "restricted" && roleNum >= 6) {
+    const elapsed = Date.now() - startTime;
+    const response = {
+      report: "I cannot discuss internal system architecture, source code, or platform build details. For technical information, please contact your administrator.",
       sql: null, steps: 0,
       inputToken: totalInputToken, outputToken: totalOutputToken,
       responseTime: elapsed,
@@ -1276,86 +1381,6 @@ async function handleDbQuestion(
 
   // ── DB QUESTION: Classify → Scope → LLM ──
   try {
-    const numUserId = Number(userId);
-
-    // STEP 2: Handle IDENTITY fast-path — rich profile, zero LLM calls
-    const IDENTITY_PATTERNS = /\b(who\s+(am\s+i|i\s+am)|my\s+name|my\s+profile|my\s+details|tell\s+me\s+about\s+(myself|me)|about\s+me)\b/i;
-
-    if (classificationResult.reason === "identity" || IDENTITY_PATTERNS.test(question)) {
-
-      const data = await getUserProfileFull(numUserId);
-
-      if (!data) {
-        // Profile not found in fast-path — return immediately to avoid 50s LLM timeout
-        logger.info(`[identity] Fast-path returned null for user ${numUserId}, returning not found`);
-        const elapsed = Date.now() - startTime;
-        const response = {
-          report: "I couldn't find your profile details. Please make sure your user ID is registered on the platform.",
-          sql: null,
-          steps: 0,
-          inputToken: totalInputToken, outputToken: totalOutputToken,
-          responseTime: elapsed,
-          responseTimeSec: (elapsed / 1000).toFixed(1),
-        };
-        setCache(responseCacheKey, response, 5 * 60_000);
-        return response;
-      } else {
-
-        const p = data.profile;
-        const profileRoleName = getRoleName(p.role || roleNum);
-
-        // Build rich markdown report (same quality as LLM but instant)
-        let report = `## Your Profile\n\n`;
-        report += `**Personal Information:**\n`;
-        report += `- **Name:** ${p.name}\n`;
-        report += `- **Email:** ${p.email}\n`;
-        report += `- **Roll Number:** ${p.roll_no || 'N/A'}\n`;
-        if (p.dob) report += `- **Date of Birth:** ${new Date(p.dob).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}\n`;
-        if (p.gender && p.gender !== 'Not set') report += `- **Gender:** ${p.gender}\n`;
-        report += `\n**Academic Information:**\n`;
-        report += `- **College:** ${p.college_name || 'N/A'}\n`;
-        report += `- **Department:** ${p.department_name || 'N/A'}\n`;
-        report += `- **Batch:** ${p.batch_name || 'N/A'}\n`;
-        if (p.section_name) report += `- **Section:** ${p.section_name}\n`;
-        report += `\n**Account Role:** ${profileRoleName}\n`;
-
-        if (data.courses.length > 0) {
-          report += `\n**Current Course Progress:**\n\n`;
-          report += `| Course | Progress | Time Spent | Dept Rank | Score |\n`;
-          report += `|--------|----------|------------|-----------|-------|\n`;
-          for (const c of data.courses) {
-            report += `| ${c.course_name} | ${c.progress_pct || 0}% | ${c.time_display} | ${c.dept_rank || '-'} | ${c.total_score || 0} |\n`;
-          }
-          report += `\n**Summary:**\n`;
-          report += `You're currently enrolled in ${data.courses.length} course${data.courses.length > 1 ? 's' : ''}. `;
-          const best = data.courses[0];
-          if (best) {
-            report += `Your strongest progress is in **${best.course_name}** at ${best.progress_pct || 0}% completion.`;
-          }
-          report += `\n\nWant to see a detailed breakdown for any course?`;
-        } else {
-          report += `\nNo course enrollments found yet.`;
-        }
-
-        logger.info(`Agent chat complete — identity fast-path`, {
-          userId, totalTimeMs: Date.now() - startTime
-        });
-
-        const identityElapsed = Date.now() - startTime;
-        const response = {
-          report,
-          sql: null,
-          steps: 0,
-          inputToken: totalInputToken,
-          outputToken: totalOutputToken,
-          responseTime: identityElapsed,
-          responseTimeSec: (identityElapsed / 1000).toFixed(1),
-        };
-        setCache(responseCacheKey, response, 5 * 60_000);
-        return response;
-      } // end of else (data found)
-    } // end of identity fast-path
-
     // STEP 2.5: Hardcoded security fallback — catch anything the LLM classifier missed
     if (scope !== 'restricted' && roleNum >= 6) {
       const restrictedCheck = checkRestrictedAccess(question, roleNum, scope);
@@ -1386,7 +1411,7 @@ async function handleDbQuestion(
           SELECT DISTINCT cam.db
           FROM course_wise_segregations cws
           JOIN course_academic_maps cam ON cws.course_allocation_id = cam.allocation_id
-          WHERE cws.user_id = ${numUserId} AND cam.db IS NOT NULL AND cws.status = 1
+          WHERE cws.user_id = ${numericUserId} AND cam.db IS NOT NULL AND cws.status = 1
         `);
         const dbPrefixes = (dbRes.rows || []).map((r: any) => r.db as string).filter(Boolean);
 
@@ -1408,7 +1433,7 @@ async function handleDbQuestion(
       }
     }
 
-    const scopeResult = buildScopePrompt(roleNum, numUserId, collegeId, scope, profile?.name, collegeShort, dynamicTables);
+    const scopeResult = buildScopePrompt(roleNum, numericUserId, collegeId, scope, profile?.name, collegeShort, dynamicTables);
 
     // STEP 4: Inject table hints if they exist
     if (tables_hint && tables_hint.length > 0) {
@@ -1436,7 +1461,7 @@ async function handleDbQuestion(
 
     // STEP 5: LLM with tools — the brain does the work
     logger.info(`LLM with tools (${options.version})`, { userId, role: roleNum, scope });
-    const result = await handleWithTools(question, numUserId, roleNum, history, options, scopeResult.prompt, scope);
+    const result = await handleWithTools(question, numericUserId, roleNum, history, options, scopeResult.prompt, scope);
     const totalTime = Date.now() - startTime;
 
     totalInputToken += result.inputToken || 0;
